@@ -46,29 +46,20 @@ pip install .
 
 ## Quick Start
 
-### 1. Store your write token
-
 ```bash
+# 1. Install
+pip install ghsu
+
+# 2. Store the write token for your org (prompts for a PAT)
 ghsu --setup <org>
-```
 
-Replace `<org>` with the GitHub organization or user whose repositories the token covers (e.g. `myorg`). You will be prompted to paste a [GitHub Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-safe/managing-your-personal-access-tokens) with the write scopes you need (e.g. `repo`).
-
-The token is validated against the GitHub API and then stored encrypted under `~/.config/ghsu/tokens/<org>.enc`.
-
-### 2. Configure your agent
-
-Give the agent a **read-only** token via the environment:
-
-```bash
+# 3. Give the agent a read-only token
 export GH_TOKEN=<your-read-only-token>
+
+# 4. Add CLAUDE.md / AGENTS.md to your repo (see below)
 ```
 
-In your agent's tool/permission configuration, allow it to call `ghsu` for write operations.
-
-### 3. Use ghsu for write operations
-
-When the agent needs to perform a write operation, it calls:
+When the agent needs to perform a write operation it calls:
 
 ```bash
 ghsu gh pr merge 123 --merge
@@ -77,6 +68,73 @@ ghsu gh pr review 7 --approve
 ```
 
 A dialog appears asking you to approve. Only after you click **Allow** does the command run.
+
+See [Setting up with your agent](#setting-up-with-your-agent) for a detailed walk-through.
+
+## Setting up with your agent
+
+The key idea: give the agent a read-only token, and instruct it to use `ghsu` for write operations. The `CLAUDE.md` / `AGENTS.md` files in the target repository carry those instructions into the agent's context automatically.
+
+### Step-by-step
+
+#### 1. Install ghsu on your machine
+
+```bash
+pip install ghsu
+```
+
+#### 2. Store the write token for your org
+
+```bash
+ghsu --setup <org>
+```
+
+You will be prompted for a [GitHub Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-safe/managing-your-personal-access-tokens) with the write scopes you need (e.g. `repo`). The token is validated and stored encrypted under `~/.config/ghsu/tokens/<org>.enc`.
+
+#### 3. Give the agent a read-only token
+
+Create a fine-grained PAT (or classic PAT with only `read:org` / `public_repo` read scopes) and expose it to the agent:
+
+```bash
+export GH_TOKEN=<your-read-only-token>
+```
+
+For Claude Code, set this in your shell or agent environment configuration. For OpenAI Codex, set it in the environment variables section of your task.
+
+#### 4. Add agent instructions to your repository
+
+Copy (or symlink) the provided `CLAUDE.md` / `AGENTS.md` files into the root of each repository where the agent will work:
+
+**For Claude Code** — add a `CLAUDE.md` (or append to an existing one):
+
+```markdown
+# GitHub access — two-token model
+
+You have been given a **read-only** GitHub token via `GH_TOKEN` / `GITHUB_TOKEN`.
+Use it freely for all read operations.
+
+For any GitHub operation that **modifies** state (merge, push, comment, label,
+close, approve, request review, etc.), prefix the command with `ghsu`:
+
+    ghsu gh pr merge 123 --merge
+    ghsu gh issue comment 42 --body "Done!"
+    ghsu gh pr review 7 --approve
+
+`ghsu` will show the user a dialog and wait for explicit approval before running
+the command with elevated permissions. If denied (exit code 2), stop and report
+to the user. Never bypass ghsu or ask the user for the write token directly.
+```
+
+**For OpenAI Codex** — add an `AGENTS.md` with the same content (the file name `AGENTS.md` is the convention Codex uses).
+
+The `CLAUDE.md` and `AGENTS.md` files in *this* repository serve as ready-to-copy templates.
+
+#### 5. Verify the setup
+
+```bash
+ghsu --verify <org>   # confirms the token decrypts and is accepted by GitHub
+ghsu --list           # shows all orgs with stored tokens
+```
 
 ## Usage
 
