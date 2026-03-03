@@ -57,11 +57,19 @@ pip install ghsudo
 #    that owns the repo (e.g. 'mycompany' for mycompany/myapp, or your username)
 ghsudo --setup <org>
 
-# 4. Give the agent a read-only token (a separate PAT with only read scopes)
-export GH_TOKEN=<your-read-only-token>
+# 4. Give the agent a read-only token — log in with a separate read-only PAT
+#    so the agent's gh commands are restricted by default
+echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
+# Alternatively, use an environment variable (session-scoped):
+# export GH_TOKEN=<your-read-only-token>
 
 # 5. Add CLAUDE.md / AGENTS.md to your repo (see below)
 ```
+
+> **⚠️ Important:** Run the agent in a **dedicated terminal** (or subshell) where
+> your personal `gh auth` is the read-only token above. Do **not** launch the agent
+> in a session where your real, writable `gh auth login` is active — this would give
+> the agent full write access and bypass ghsudo's read-only restriction.
 
 When the agent needs to perform a write operation it calls:
 
@@ -103,13 +111,30 @@ You will be prompted to paste your [GitHub Personal Access Token](https://docs.g
 
 #### 3. Give the agent a read-only token
 
-Create a separate PAT with **only read scopes** (fine-grained PAT with read-only permissions, or classic PAT with only `read:org` / `public_repo`) and expose it to the agent:
+Create a separate PAT with **only read scopes** (fine-grained PAT with read-only permissions, or classic PAT with only `read:org` / `public_repo`), then configure it for the agent.
+
+**Recommended — `gh auth login` (persistent across all gh commands in the session):**
+
+```bash
+echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
+```
+
+This stores the token as the active GitHub credential for the `gh` CLI. All `gh` read operations in that session will use it, and write operations will fail (prompting the agent to use `ghsudo`).
+
+**Alternative — environment variable (session-scoped):**
 
 ```bash
 export GH_TOKEN=<your-read-only-token>
 ```
 
-This is the token the agent uses by default. Because it is read-only, it cannot perform write operations — write operations must go through `ghsudo`.
+`GH_TOKEN` takes precedence over `gh auth login` credentials, so setting it achieves the same restriction for the duration of the shell session.
+
+> **⚠️ Warning:** Do **not** launch the agent in a terminal where your real, writable
+> `gh auth login` is active without setting `GH_TOKEN`. If no `GH_TOKEN` or
+> `GITHUB_TOKEN` is set, the agent inherits your personal GitHub credentials (which
+> may have full write access), bypassing ghsudo's read-only restriction. `ghsudo`
+> will print a warning if it detects this situation. Use a dedicated terminal or
+> subshell for the agent session.
 
 #### 4. Add agent instructions to your repository
 
