@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ghsu — GitHub Sudo: re-execute commands with an elevated GitHub token.
+"""ghsudo — GitHub Sudo: re-execute commands with an elevated GitHub token.
 
 Two-token model: Claude normally uses a read-only token. When a command gets
-HTTP 403 (Forbidden), ghsu re-runs it with a stored read-write token after
+HTTP 403 (Forbidden), ghsudo re-runs it with a stored read-write token after
 the user confirms via GUI popup or terminal prompt.
 
 Supports per-organization tokens: each GitHub org/owner gets its own encrypted
@@ -39,7 +39,7 @@ _GUI_TIMEOUT = 60  # seconds — dialog auto-denies if user doesn't respond
 _CONFIG_DIR = Path.home() / ".config" / "ghsudo"
 _TOKENS_DIR = _CONFIG_DIR / "tokens"
 
-_README_URL = "https://github.com/lklimek/ghsu#readme"
+_README_URL = "https://github.com/lklimek/ghsudo#readme"
 
 # Exit codes
 EXIT_OK = 0
@@ -49,7 +49,7 @@ EXIT_NO_INTERACTIVE = 3
 EXIT_NO_TOKEN = 4
 
 
-_VERBOSE = os.environ.get("GHSU_DEBUG", "") != ""
+_VERBOSE = os.environ.get("GHSUDO_DEBUG", "") != ""
 _T0 = time.monotonic()
 
 

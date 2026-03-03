@@ -31,14 +31,14 @@ The write token never appears in agent context or logs — it is encrypted at re
 ## Installation
 
 ```bash
-pip install ghsu
+pip install ghsudo
 ```
 
 Or install from source:
 
 ```bash
-git clone https://github.com/lklimek/ghsu
-cd ghsu
+git clone https://github.com/lklimek/ghsudo
+cd ghsudo
 pip install .
 ```
 
@@ -48,7 +48,7 @@ pip install .
 
 ```bash
 # 1. Install
-pip install ghsu
+pip install ghsudo
 
 # 2. Store the write token for your org (prompts for a PAT)
 ghsudo --setup <org>
@@ -80,7 +80,7 @@ The key idea: give the agent a read-only token, and instruct it to use `ghsudo` 
 #### 1. Install ghsudo on your machine
 
 ```bash
-pip install ghsu
+pip install ghsudo
 ```
 
 #### 2. Store the write token for your org
@@ -203,8 +203,8 @@ The dialog auto-denies after **60 seconds** of no response to prevent the agent 
 
 ## Debugging
 
-Set `GHSU_DEBUG=1` to enable verbose timing output on stderr:
+Set `GHSUDO_DEBUG=1` to enable verbose timing output on stderr:
 
 ```bash
-GHSU_DEBUG=1 ghsudo gh pr list
+GHSUDO_DEBUG=1 ghsudo gh pr list
 ```

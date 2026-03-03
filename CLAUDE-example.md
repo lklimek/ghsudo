@@ -14,4 +14,4 @@ ghsudo gh issue comment 42 --body "Done!"
 - **Never** bypass `ghsudo` or ask the user for the write token directly.
 - Exit code 2 (denied): stop and report to the user.
 - Exit code 3 (no interactive session): inform the user approval is not possible.
-- Exit code 4 (not set up): tell the user to follow <https://github.com/lklimek/ghsu#readme>.
+- Exit code 4 (not set up): tell the user to follow <https://github.com/lklimek/ghsudo#readme>.
