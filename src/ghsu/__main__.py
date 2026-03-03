@@ -29,14 +29,14 @@ from pathlib import Path
 # Constants
 # ---------------------------------------------------------------------------
 
-_PREFIX = "[ghsu]"
+_PREFIX = "[ghsudo]"
 _VERSION_BYTE = b"\x01"
-_PBKDF2_SALT = b"ghsu-claudius-token-encryption-v1"
+_PBKDF2_SALT = b"ghsu-claudius-token-encryption-v1"  # kept as-is for backward compat with existing encrypted tokens
 _PBKDF2_ITERATIONS = 600_000
 _NONCE_LEN = 12  # 96-bit nonce for AES-GCM
 _GUI_TIMEOUT = 60  # seconds — dialog auto-denies if user doesn't respond
 
-_CONFIG_DIR = Path.home() / ".config" / "ghsu"
+_CONFIG_DIR = Path.home() / ".config" / "ghsudo"
 _TOKENS_DIR = _CONFIG_DIR / "tokens"
 
 _README_URL = "https://github.com/lklimek/ghsu#readme"
@@ -239,7 +239,7 @@ def _load_token(org: str) -> str:
         if orgs:
             _err(f"Available orgs: {', '.join(orgs)}\n")
         _err("To set up a token, run:")
-        _err(f"    ghsu --setup {org}\n")
+        _err(f"    ghsudo --setup {org}\n")
         _err(
             "This will prompt you for a GitHub Personal Access Token with"
         )
@@ -256,7 +256,7 @@ def _load_token(org: str) -> str:
         _err(
             "Was it stored on a different machine, or did the hostname change?"
         )
-        _err(f"Re-run:  ghsu --setup {org}")
+        _err(f"Re-run:  ghsudo --setup {org}")
         sys.exit(EXIT_ERROR)
 
 
@@ -390,7 +390,7 @@ def _ask_zenity(cmd_str: str, org: str) -> bool | None:
     msg = _format_approval_msg(cmd_str, org)
     rc = _run_gui([
         "zenity", "--question",
-        "--title=GitHub Elevated Access (ghsu)",
+        "--title=GitHub Elevated Access (ghsudo)",
         f"--text={msg}", "--width=500",
         "--ok-label=Allow", "--cancel-label=Deny",
     ])
@@ -403,7 +403,7 @@ def _ask_kdialog(cmd_str: str, org: str) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     msg = _format_approval_msg(cmd_str, org)
     rc = _run_gui([
-        "kdialog", "--title", "GitHub Elevated Access (ghsu)",
+        "kdialog", "--title", "GitHub Elevated Access (ghsudo)",
         "--yesno", msg,
         "--yes-label", "Allow", "--no-label", "Deny",
     ])
@@ -422,7 +422,7 @@ def _ask_osascript(cmd_str: str, org: str) -> bool | None:
         f'display dialog "{escaped}" '
         f'buttons {{"Deny", "Allow"}} cancel button "Deny" '
         f'default button "Deny" '
-        f'with title "GitHub Elevated Access (ghsu)" with icon caution'
+        f'with title "GitHub Elevated Access (ghsudo)" with icon caution'
     )
     rc = _run_gui(["osascript", "-e", script])
     if rc is None:
@@ -440,7 +440,7 @@ def _ask_powershell(cmd_str: str, org: str) -> bool | None:
         f"`n`nOrganization: {org}"
         f"`nCommand to execute:`n  {escaped}`n`n"
         f"Allow this command to run with elevated GitHub permissions?\","
-        f"\"GitHub Elevated Access (ghsu)\","
+        f"\"GitHub Elevated Access (ghsudo)\","
         "[System.Windows.Forms.MessageBoxButtons]::YesNo,"
         "[System.Windows.Forms.MessageBoxIcon]::Warning); "
         'if ($r -eq "Yes") { exit 0 } else { exit 1 }'
@@ -525,7 +525,7 @@ def _validate_token(token: str) -> dict | None:
         headers={
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "ghsu/1.0",
+            "User-Agent": "ghsudo/1.0",
         },
     )
     try:
@@ -546,7 +546,7 @@ def _get_token_scopes(token: str) -> str | None:
         headers={
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "ghsu/1.0",
+            "User-Agent": "ghsudo/1.0",
         },
     )
     try:
@@ -615,7 +615,7 @@ def cmd_run(cmd: list[str], *, org: str | None = None, no_gui: bool = False) -> 
     """Show approval dialog, then re-execute command with elevated token."""
     if not cmd:
         _err("No command specified.")
-        _err("Usage: ghsu <command...>")
+        _err("Usage: ghsudo <command...>")
         return EXIT_ERROR
 
     # Determine org
@@ -632,12 +632,12 @@ def cmd_run(cmd: list[str], *, org: str | None = None, no_gui: bool = False) -> 
             _err("Cannot determine target organization.\n")
             _err(f"Available orgs: {', '.join(orgs)}")
             _err("Use --org <name> to specify, e.g.:")
-            _err(f"    ghsu --org {orgs[0]} {shlex.join(cmd)}")
+            _err(f"    ghsudo --org {orgs[0]} {shlex.join(cmd)}")
             return EXIT_ERROR
         else:
             _err("No tokens configured.\n")
             _err("To set up a token, run:")
-            _err("    ghsu --setup <org>")
+            _err("    ghsudo --setup <org>")
             _err(f"\nSee: {_README_URL}")
             sys.exit(EXIT_NO_TOKEN)
 
@@ -675,7 +675,7 @@ def cmd_verify(org: str | None = None) -> int:
     orgs = _list_orgs()
     if not orgs:
         _err("No tokens stored.")
-        _err("Run:  ghsu --setup <org>")
+        _err("Run:  ghsudo --setup <org>")
         return EXIT_NO_TOKEN
 
     failures = 0
@@ -701,7 +701,7 @@ def _verify_one(org: str) -> int:
     user_info = _validate_token(token)
     if not user_info:
         _err(f"Token for '{org}' rejected by GitHub. It may be expired.")
-        _err(f"Re-run:  ghsu --setup {org}")
+        _err(f"Re-run:  ghsudo --setup {org}")
         return EXIT_ERROR
 
     scopes = _get_token_scopes(token) or "unknown"
@@ -765,7 +765,7 @@ def cmd_list() -> int:
     orgs = _list_orgs()
     if not orgs:
         _info("No tokens stored.")
-        _info("Run:  ghsu --setup <org>")
+        _info("Run:  ghsudo --setup <org>")
         return EXIT_OK
 
     _info(f"Stored tokens ({len(orgs)}):")
@@ -779,15 +779,15 @@ def cmd_list() -> int:
 # ---------------------------------------------------------------------------
 
 _USAGE = """\
-usage: ghsu [options] <command...>
-       ghsu --setup <org>
-       ghsu --list | --verify [org] | --revoke [org]
+usage: ghsudo [options] <command...>
+       ghsudo --setup <org>
+       ghsudo --list | --verify [org] | --revoke [org]
 
 GitHub Sudo — re-execute commands with per-org elevated tokens.
 
 Anything not prefixed with -- is the command to run:
-  ghsu gh pr merge 123
-  ghsu --org dashpay gh pr list
+  ghsudo gh pr merge 123
+  ghsudo --org dashpay gh pr list
 
 Options:
   --org ORG       Target org (auto-detected from -R flag or git remote)

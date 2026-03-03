@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ghsu = "ghsu.__main__:main"
+ghsudo = "ghsu.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/lklimek/ghsu"
