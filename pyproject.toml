@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghsu"
+version = "1.0.0"
+description = "GitHub Sudo — re-execute commands with an elevated GitHub token after user approval"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=41.0",
+]
+
+[project.scripts]
+ghsu = "ghsu.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/lklimek/ghsu"
+Repository = "https://github.com/lklimek/ghsu"
+
+[tool.setuptools.packages.find]
+where = ["src"]
