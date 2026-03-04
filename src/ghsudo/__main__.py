@@ -259,22 +259,31 @@ def _load_token(org: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _parse_repo_slug(value: str) -> str | None:
+    """Validate and normalize an owner/repo slug. Returns None if invalid."""
+    value = value.strip().lower()
+    parts = value.split("/")
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return value
+    return None
+
+
 def _detect_repo_slug_from_args(cmd: list[str]) -> str | None:
     """Extract owner/repo slug from -R/--repo in gh command args."""
     for i, arg in enumerate(cmd):
         if arg in ("-R", "--repo") and i + 1 < len(cmd):
-            repo_arg = cmd[i + 1]
-            if "/" in repo_arg:
-                return repo_arg.strip().lower()
+            slug = _parse_repo_slug(cmd[i + 1])
+            if slug:
+                return slug
         # Handle --repo=owner/repo
         if arg.startswith("--repo="):
-            repo_arg = arg.split("=", 1)[1]
-            if "/" in repo_arg:
-                return repo_arg.strip().lower()
+            slug = _parse_repo_slug(arg.split("=", 1)[1])
+            if slug:
+                return slug
         if arg.startswith("-R") and len(arg) > 2:
-            repo_arg = arg[2:]
-            if "/" in repo_arg:
-                return repo_arg.strip().lower()
+            slug = _parse_repo_slug(arg[2:])
+            if slug:
+                return slug
     return None
 
 

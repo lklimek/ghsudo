@@ -59,6 +59,15 @@ class TestDetectRepoSlugFromArgs:
     def test_whitespace_trimmed(self):
         assert _detect_repo_slug_from_args(["gh", "-R", "  Org/Repo  "]) == "org/repo"
 
+    def test_trailing_slash_rejected(self):
+        assert _detect_repo_slug_from_args(["gh", "-R", "org/"]) is None
+
+    def test_leading_slash_rejected(self):
+        assert _detect_repo_slug_from_args(["gh", "-R", "/repo"]) is None
+
+    def test_extra_segments_rejected(self):
+        assert _detect_repo_slug_from_args(["gh", "-R", "a/b/c"]) is None
+
 
 # ---------------------------------------------------------------------------
 # _detect_repo_slug_from_git_remote
