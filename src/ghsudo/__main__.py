@@ -493,22 +493,6 @@ def _ask_powershell(cmd_str: str, org: str, repo: str | None = None) -> bool | N
     return rc == 0
 
 
-def _ask_terminal(cmd_str: str, org: str, repo: str | None = None) -> bool:
-    if not sys.stdin.isatty():
-        return False
-    _info("GitHub elevated access required.")
-    if repo:
-        _info(f"Repository: {repo}")
-    else:
-        _info(f"Organization: {org}")
-    _info(f"Command: {cmd_str}")
-    try:
-        answer = input(f"{_PREFIX} Allow? (yes/no): ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return answer in ("yes", "y")
-
-
 def _has_display() -> bool:
     """Check if a graphical display is available."""
     system = platform.system()
@@ -520,14 +504,12 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _ask_approval(
-    cmd_str: str, org: str, *, no_gui: bool = False, repo: str | None = None
-) -> bool:
+def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
     """Ask the user to approve the command. Returns True if approved."""
     system = platform.system()
-    _debug(f"approval: system={system}, no_gui={no_gui}, has_display={_has_display()}")
+    _debug(f"approval: system={system}, has_display={_has_display()}")
 
-    if not no_gui and _has_display():
+    if _has_display():
         gui_result = None
         if system == "Linux":
             # Try lightest first: xmessage → zenity → kdialog
@@ -545,15 +527,10 @@ def _ask_approval(
         if gui_result is not None:
             return gui_result
 
-    # Terminal fallback (only reached if GUI unavailable/timed out)
-    if _ask_terminal(cmd_str, org, repo):
-        return True
-
-    if not sys.stdin.isatty():
-        _err("Cannot request approval: no display and no terminal available.")
-        sys.exit(EXIT_NO_INTERACTIVE)
-
-    return False
+    # No GUI available — cannot safely prompt (terminal is trivially auto-approvable)
+    _err("Cannot request approval: no graphical display available.")
+    _err("Ensure DISPLAY or WAYLAND_DISPLAY is set (e.g. ssh -X).")
+    sys.exit(EXIT_NO_INTERACTIVE)
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +635,7 @@ def cmd_setup(org: str) -> int:
     return EXIT_OK
 
 
-def cmd_run(cmd: list[str], *, org: str | None = None, no_gui: bool = False) -> int:
+def cmd_run(cmd: list[str], *, org: str | None = None) -> int:
     """Show approval dialog, then re-execute command with elevated token."""
     if not cmd:
         _err("No command specified.")
@@ -702,7 +679,7 @@ def cmd_run(cmd: list[str], *, org: str | None = None, no_gui: bool = False) -> 
     _debug(f"repo_slug={repo_slug}")
 
     _debug("requesting approval")
-    if not _ask_approval(cmd_str, org, no_gui=no_gui, repo=repo_slug):
+    if not _ask_approval(cmd_str, org, repo=repo_slug):
         _info("Permission denied by user.")
         return EXIT_DENIED
     _debug("approved, executing command")
@@ -842,7 +819,6 @@ Anything not prefixed with -- is the command to run:
 
 Options:
   --org ORG       Target org (auto-detected from -R flag or git remote)
-  --no-gui        Skip GUI dialog, use terminal prompt only
   --setup ORG     Store encrypted GitHub PAT for an org
   --verify [ORG]  Verify stored token(s)
   --revoke [ORG]  Revoke stored token(s)
@@ -860,7 +836,6 @@ def main() -> int:
 
     # Parse -- flags, collect the rest as the command
     org: str | None = None
-    no_gui = False
     cmd: list[str] = []
     i = 0
     while i < len(argv):
@@ -893,17 +868,13 @@ def main() -> int:
             org = argv[i + 1]
             i += 2
             continue
-        elif arg == "--no-gui":
-            no_gui = True
-            i += 1
-            continue
         else:
             # Everything from here on is the command
             cmd = argv[i:]
             break
         i += 1
 
-    return cmd_run(cmd, org=org, no_gui=no_gui)
+    return cmd_run(cmd, org=org)
 
 
 if __name__ == "__main__":

@@ -183,7 +183,6 @@ GitHub Sudo — re-execute commands with per-org elevated tokens.
 
 Options:
   --org ORG       Target org (auto-detected from -R flag or git remote)
-  --no-gui        Skip GUI dialog, use terminal prompt only
   --setup ORG     Store encrypted GitHub PAT for an org
   --verify [ORG]  Verify stored token(s)
   --revoke [ORG]  Revoke stored token(s)
@@ -213,7 +212,7 @@ On **Linux**, `ghsudo` tries (in order): `xmessage`, `zenity`, `kdialog`.
 On **macOS**, it uses `osascript` (the built-in AppleScript runner).  
 On **Windows**, it uses PowerShell's `MessageBox`.
 
-If no GUI is available (e.g. headless server), it falls back to a terminal prompt. Use `--no-gui` to force terminal-only mode.
+A graphical display is **required** — `ghsudo` will refuse to run without one, because a terminal prompt can be trivially auto-approved by an AI agent, defeating the purpose. If no GUI toolkit is found, `ghsudo` exits with code 3.
 
 > **Tip:** If you run your agent on a remote machine via SSH, use `ssh -X` (X11 forwarding) so that `ghsudo` GUI dialogs appear on your local display.
 
@@ -242,7 +241,7 @@ The dialog auto-denies after **60 seconds** of no response to prevent the agent 
 | 0 | Success |
 | 1 | Error |
 | 2 | User denied the request |
-| 3 | No interactive session available to ask for approval |
+| 3 | No graphical display available to show approval dialog |
 | 4 | No token stored for the target org |
 
 ## Debugging
