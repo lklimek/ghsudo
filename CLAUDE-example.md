@@ -11,6 +11,7 @@ ghsudo gh issue comment 42 --body "Done!"
 
 ## Rules
 
+- **Always** use `https://` URLs for git remotes (required for `ghsudo` token injection). If git push/pull fails over HTTPS, remind the user to run `gh auth setup-git` to configure the credential helper.
 - **Never** bypass `ghsudo` or ask the user for the write token directly.
 - Exit code 2 (denied): stop and report to the user.
 - Exit code 3 (no interactive session): inform the user approval is not possible.

@@ -42,6 +42,12 @@ cd ghsudo
 pip install .
 ```
 
+> **Note:** Git remotes **must** use `https://` URLs (not SSH). `ghsudo` injects the elevated token via `GH_TOKEN`/`GITHUB_TOKEN` environment variables, which only work with HTTPS remotes.
+> To make `git` use `gh` as its credential helper (so `git push`/`pull` work over HTTPS), run:
+> ```bash
+> gh auth setup-git
+> ```
+
 **Requirement:** Python 3.10+
 
 > **Note:** Only **Linux** is actively tested. macOS and Windows have basic support (GUI dialogs, path handling) but are **not tested** — contributions welcome.
