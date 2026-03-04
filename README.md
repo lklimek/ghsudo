@@ -50,16 +50,28 @@ pip install .
 # 1. Install
 pip install ghsudo
 
-# 2. Store the write token for your org (prompts for a PAT)
+# 2. Create a write-access GitHub PAT at https://github.com/settings/tokens
+#    (classic PAT with 'repo' scope, or fine-grained with the permissions you need)
+
+# 3. Store the write token — <org> is the GitHub organization or user account
+#    that owns the repo (e.g. 'mycompany' for mycompany/myapp, or your username)
 ghsudo --setup <org>
 
-# 3. Give the agent a read-only token
-export GH_TOKEN=<your-read-only-token>
+# 4. Give the agent a read-only token — log in with a separate read-only PAT
+#    so the agent's gh commands are restricted by default
+echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
+# Alternatively, use an environment variable (session-scoped):
+# export GH_TOKEN=<your-read-only-token>
 
-# 4. Add CLAUDE-example.md / AGENTS-example.md to your repo (see below)
+# 5. Add CLAUDE.md / AGENTS.md to your repo (see below)
 ```
 
-When the agent needs to perform a write operation it calls:
+> **⚠️ Important:** Run the agent in a **dedicated terminal** (or subshell) where
+> your `gh` is authenticated with the read-only token above. Do **not** launch the agent
+> in a session where your real, writable `gh auth login` is active — this would give
+> the agent full write access and bypass ghsudo's read-only restriction.
+
+When the agent needs to perform a write operation, it calls:
 
 ```bash
 ghsudo gh pr merge 123 --merge
@@ -73,7 +85,7 @@ See [Setting up with your agent](#setting-up-with-your-agent) for a detailed wal
 
 ## Setting up with your agent
 
-The key idea: give the agent a read-only token, and instruct it to use `ghsudo` for write operations. The `CLAUDE-example.md` / `AGENTS-example.md` files in the target repository carry those instructions into the agent's context automatically.
+The key idea: give the agent a read-only token, and instruct it to use `ghsudo` for write operations. A `CLAUDE.md` / `AGENTS.md` file in the target repository carries those instructions into the agent's context automatically.
 
 ### Step-by-step
 
@@ -83,29 +95,51 @@ The key idea: give the agent a read-only token, and instruct it to use `ghsudo` 
 pip install ghsudo
 ```
 
-#### 2. Store the write token for your org
+#### 2. Create a write-access GitHub PAT and store it
+
+Go to [GitHub Settings → Developer Settings → Personal access tokens](https://github.com/settings/tokens) and generate a new token with the write scopes you need (e.g. the `repo` scope for a classic PAT, or the relevant fine-grained permissions).
+
+Then store it with `ghsudo`:
 
 ```bash
 ghsudo --setup <org>
 ```
 
-You will be prompted for a [GitHub Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-safe/managing-your-personal-access-tokens) with the write scopes you need (e.g. `repo`). The token is validated and stored encrypted under `~/.config/ghsudo/tokens/<org>.enc`.
+`<org>` is the GitHub organization or personal user account name that owns the repositories you work with — the owner part of an `owner/repo` pair. For example, for `mycompany/myapp` use `mycompany`; for your own repos use your GitHub username.
+
+You will be prompted to paste your [GitHub Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens). The token is validated and stored encrypted under `~/.config/ghsudo/tokens/<org>.enc`.
 
 #### 3. Give the agent a read-only token
 
-Create a fine-grained PAT (or classic PAT with only `read:org` / `public_repo` read scopes) and expose it to the agent:
+Create a separate PAT with **only read scopes** (fine-grained PAT with read-only permissions, or classic PAT with only `read:org` / `public_repo`), then configure it for the agent.
+
+**Recommended — `gh auth login` (persistent across all gh commands in the session):**
+
+```bash
+echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
+```
+
+This stores the token as the active GitHub credential for the `gh` CLI. All `gh` read operations in that session will use it, and write operations will fail (prompting the agent to use `ghsudo`).
+
+**Alternative — environment variable (session-scoped):**
 
 ```bash
 export GH_TOKEN=<your-read-only-token>
 ```
 
-For Claude Code, set this in your shell or agent environment configuration. For OpenAI Codex, set it in the environment variables section of your task.
+`GH_TOKEN` takes precedence over `gh auth login` credentials, so setting it achieves the same restriction for the duration of the shell session.
+
+> **⚠️ Warning:** Do **not** launch the agent in a terminal where your real, writable
+> `gh auth login` is active without setting `GH_TOKEN`. If no `GH_TOKEN` or
+> `GITHUB_TOKEN` is set, the agent inherits your personal GitHub credentials (which
+> may have full write access), bypassing ghsudo's read-only restriction. Use a dedicated
+> terminal or subshell for the agent session.
 
 #### 4. Add agent instructions to your repository
 
-Copy (or symlink) the provided `CLAUDE-example.md` / `AGENTS-example.md` files into the root of each repository where the agent will work:
+Copy the provided template files into the root of each repository where the agent will work:
 
-**For Claude Code** — add a `CLAUDE-example.md` (or append to an existing one):
+**For Claude Code** — copy [`CLAUDE-example.md`](CLAUDE-example.md) as `CLAUDE.md` in your repo (or append its contents to an existing `CLAUDE.md`):
 
 ```markdown
 # GitHub access — two-token model
@@ -125,9 +159,9 @@ the command with elevated permissions. If denied (exit code 2), stop and report
 to the user. Never bypass ghsudo or ask the user for the write token directly.
 ```
 
-**For OpenAI Codex** — copy `AGENTS-example.md` as `AGENTS.md` in your repo (the file name `AGENTS.md` is the convention Codex uses).
+**For OpenAI Codex** — copy [`AGENTS-example.md`](AGENTS-example.md) as `AGENTS.md` in your repo (the file name `AGENTS.md` is the convention Codex uses).
 
-The `CLAUDE-example.md` and `AGENTS-example.md` files in *this* repository serve as ready-to-copy templates.
+The [`CLAUDE-example.md`](CLAUDE-example.md) and [`AGENTS-example.md`](AGENTS-example.md) files in *this* repository serve as ready-to-copy templates.
 
 #### 5. Verify the setup
 
@@ -154,6 +188,12 @@ Options:
   --list          List orgs with stored tokens
   -h, --help      Show this help
 ```
+
+### What is an org?
+
+In `ghsudo`, *org* refers to the GitHub organization or personal user account that owns the repositories you work with — the owner part of an `owner/repo` pair. For example, for `microsoft/vscode` the org is `microsoft`; for a personal repo like `alice/project` the org is `alice`.
+
+Each org can have its own stored write token, allowing you to work across multiple organizations with separate credentials.
 
 ### Org auto-detection
 
