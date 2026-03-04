@@ -5,7 +5,6 @@ from __future__ import annotations
 from unittest.mock import patch, MagicMock
 import subprocess
 
-import pytest
 
 from ghsudo.__main__ import (
     _detect_org,
@@ -27,16 +26,28 @@ class TestDetectRepoSlugFromArgs:
     """Tests for extracting owner/repo from gh CLI arguments."""
 
     def test_dash_R_separate(self):
-        assert _detect_repo_slug_from_args(["gh", "pr", "-R", "acme/widget", "list"]) == "acme/widget"
+        assert (
+            _detect_repo_slug_from_args(["gh", "pr", "-R", "acme/widget", "list"])
+            == "acme/widget"
+        )
 
     def test_dash_R_attached(self):
-        assert _detect_repo_slug_from_args(["gh", "pr", "-Racme/widget", "list"]) == "acme/widget"
+        assert (
+            _detect_repo_slug_from_args(["gh", "pr", "-Racme/widget", "list"])
+            == "acme/widget"
+        )
 
     def test_long_repo_separate(self):
-        assert _detect_repo_slug_from_args(["gh", "issue", "--repo", "Org/Repo"]) == "org/repo"
+        assert (
+            _detect_repo_slug_from_args(["gh", "issue", "--repo", "Org/Repo"])
+            == "org/repo"
+        )
 
     def test_long_repo_equals(self):
-        assert _detect_repo_slug_from_args(["gh", "--repo=Org/Repo", "pr", "list"]) == "org/repo"
+        assert (
+            _detect_repo_slug_from_args(["gh", "--repo=Org/Repo", "pr", "list"])
+            == "org/repo"
+        )
 
     def test_no_repo_flag(self):
         assert _detect_repo_slug_from_args(["gh", "pr", "list"]) is None

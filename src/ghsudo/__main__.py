@@ -474,7 +474,8 @@ def _ask_osascript(cmd_str: str, org: str, repo: str | None = None) -> bool | No
 def _ask_powershell(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     escaped = _escape_for_powershell(cmd_str)
-    target = f"Repository: {repo}" if repo else f"Organization: {org}"
+    raw_target = f"Repository: {repo}" if repo else f"Organization: {org}"
+    target = _escape_for_powershell(raw_target)
     ps = (
         "Add-Type -AssemblyName System.Windows.Forms; "
         "$r = [System.Windows.Forms.MessageBox]::Show("
@@ -527,9 +528,15 @@ def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
         if gui_result is not None:
             return gui_result
 
-    # No GUI available — cannot safely prompt (terminal is trivially auto-approvable)
-    _err("Cannot request approval: no graphical display available.")
-    _err("Ensure DISPLAY or WAYLAND_DISPLAY is set (e.g. ssh -X).")
+    # Cannot get user approval — either no display or no GUI toolkit found
+    if not _has_display():
+        _err("Cannot request approval: no graphical display available.")
+        _err("Ensure DISPLAY or WAYLAND_DISPLAY is set (e.g. ssh -X).")
+    else:
+        _err("Cannot request approval: no supported GUI dialog tool found.")
+        if system == "Linux":
+            _err("Install one of: xmessage, zenity, kdialog.")
+        _err("Display is available but no toolkit could show the dialog.")
     sys.exit(EXIT_NO_INTERACTIVE)
 
 

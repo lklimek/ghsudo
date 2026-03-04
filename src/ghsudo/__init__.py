@@ -1,5 +1,8 @@
 """ghsudo — GitHub Sudo: re-execute commands with an elevated GitHub token."""
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = version("ghsudo")
+try:
+    __version__ = version("ghsudo")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
