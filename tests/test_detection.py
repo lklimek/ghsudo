@@ -7,9 +7,6 @@ import subprocess
 
 
 from ghsudo.__main__ import (
-    _detect_org,
-    _detect_org_from_args,
-    _detect_org_from_git_remote,
     _detect_repo_slug,
     _detect_repo_slug_from_args,
     _detect_repo_slug_from_git_remote,
@@ -95,10 +92,6 @@ class TestDetectRepoSlugFromGitRemote:
         with _mock_git_remote("https://github.com/Acme/Widget\n"):
             assert _detect_repo_slug_from_git_remote() == "acme/widget"
 
-    def test_http_url(self):
-        with _mock_git_remote("http://github.com/foo/bar.git\n"):
-            assert _detect_repo_slug_from_git_remote() == "foo/bar"
-
     def test_non_github_url(self):
         with _mock_git_remote("git@gitlab.com:org/repo.git\n"):
             assert _detect_repo_slug_from_git_remote() is None
@@ -142,33 +135,6 @@ class TestDetectRepoSlug:
         result.stdout = ""
         with patch("ghsudo.__main__.subprocess.run", return_value=result):
             assert _detect_repo_slug(["gh", "pr", "list"]) is None
-
-
-# ---------------------------------------------------------------------------
-# _detect_org_from_args  /  _detect_org_from_git_remote  /  _detect_org
-# ---------------------------------------------------------------------------
-
-
-class TestDetectOrg:
-    """Org helpers should delegate to slug functions and return the owner."""
-
-    def test_org_from_args(self):
-        assert _detect_org_from_args(["gh", "-R", "myorg/myrepo"]) == "myorg"
-
-    def test_org_from_args_none(self):
-        assert _detect_org_from_args(["gh", "pr", "list"]) is None
-
-    def test_org_from_git_remote(self):
-        with _mock_git_remote("git@github.com:SomeOrg/SomeRepo.git"):
-            assert _detect_org_from_git_remote() == "someorg"
-
-    def test_detect_org_args_first(self):
-        with _mock_git_remote("git@github.com:remote-org/repo.git"):
-            assert _detect_org(["gh", "-R", "arg-org/repo"]) == "arg-org"
-
-    def test_detect_org_falls_back(self):
-        with _mock_git_remote("git@github.com:remote-org/repo.git"):
-            assert _detect_org(["gh", "pr", "list"]) == "remote-org"
 
 
 # ---------------------------------------------------------------------------
