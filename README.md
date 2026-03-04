@@ -67,11 +67,11 @@ echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
 ```
 
 > **⚠️ Important:** Run the agent in a **dedicated terminal** (or subshell) where
-> your personal `gh auth` is the read-only token above. Do **not** launch the agent
+> your `gh` is authenticated with the read-only token above. Do **not** launch the agent
 > in a session where your real, writable `gh auth login` is active — this would give
 > the agent full write access and bypass ghsudo's read-only restriction.
 
-When the agent needs to perform a write operation it calls:
+When the agent needs to perform a write operation, it calls:
 
 ```bash
 ghsudo gh pr merge 123 --merge
@@ -132,9 +132,8 @@ export GH_TOKEN=<your-read-only-token>
 > **⚠️ Warning:** Do **not** launch the agent in a terminal where your real, writable
 > `gh auth login` is active without setting `GH_TOKEN`. If no `GH_TOKEN` or
 > `GITHUB_TOKEN` is set, the agent inherits your personal GitHub credentials (which
-> may have full write access), bypassing ghsudo's read-only restriction. `ghsudo`
-> will print a warning if it detects this situation. Use a dedicated terminal or
-> subshell for the agent session.
+> may have full write access), bypassing ghsudo's read-only restriction. Use a dedicated
+> terminal or subshell for the agent session.
 
 #### 4. Add agent instructions to your repository
 
