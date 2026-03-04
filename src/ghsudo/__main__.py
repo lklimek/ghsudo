@@ -146,9 +146,7 @@ def _derive_machine_key() -> bytes:
         raise RuntimeError("Cannot derive machine key: no stable identifiers")
 
     raw = "|".join(components).encode("utf-8")
-    key = hashlib.pbkdf2_hmac(
-        "sha256", raw, _PBKDF2_SALT, _PBKDF2_ITERATIONS
-    )
+    key = hashlib.pbkdf2_hmac("sha256", raw, _PBKDF2_SALT, _PBKDF2_ITERATIONS)
     _debug("machine key derived")
     return key
 
@@ -240,9 +238,7 @@ def _load_token(org: str) -> str:
             _err(f"Available orgs: {', '.join(orgs)}\n")
         _err("To set up a token, run:")
         _err(f"    ghsudo --setup {org}\n")
-        _err(
-            "This will prompt you for a GitHub Personal Access Token with"
-        )
+        _err("This will prompt you for a GitHub Personal Access Token with")
         _err("write permissions and store it encrypted on this machine.\n")
         _err(f"See: {_README_URL}")
         sys.exit(EXIT_NO_TOKEN)
@@ -253,9 +249,7 @@ def _load_token(org: str) -> str:
         return _decrypt_token(data, key)
     except Exception:  # noqa: BLE001
         _err(f"Failed to decrypt token for org '{org}'.")
-        _err(
-            "Was it stored on a different machine, or did the hostname change?"
-        )
+        _err("Was it stored on a different machine, or did the hostname change?")
         _err(f"Re-run:  ghsudo --setup {org}")
         sys.exit(EXIT_ERROR)
 
@@ -265,27 +259,36 @@ def _load_token(org: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _detect_org_from_args(cmd: list[str]) -> str | None:
-    """Extract org from -R/--repo owner/repo in gh command args."""
-    for i, arg in enumerate(cmd):
-        if arg in ("-R", "--repo") and i + 1 < len(cmd):
-            repo_arg = cmd[i + 1]
-            if "/" in repo_arg:
-                return repo_arg.split("/")[0].lower()
-        # Handle --repo=owner/repo
-        if arg.startswith("--repo="):
-            repo_arg = arg.split("=", 1)[1]
-            if "/" in repo_arg:
-                return repo_arg.split("/")[0].lower()
-        if arg.startswith("-R") and len(arg) > 2:
-            repo_arg = arg[2:]
-            if "/" in repo_arg:
-                return repo_arg.split("/")[0].lower()
+def _parse_repo_slug(value: str) -> str | None:
+    """Validate and normalize an owner/repo slug. Returns None if invalid."""
+    value = value.strip().lower()
+    parts = value.split("/")
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return value
     return None
 
 
-def _detect_org_from_git_remote() -> str | None:
-    """Extract org from the current repo's origin remote."""
+def _detect_repo_slug_from_args(cmd: list[str]) -> str | None:
+    """Extract owner/repo slug from -R/--repo in gh command args."""
+    for i, arg in enumerate(cmd):
+        if arg in ("-R", "--repo") and i + 1 < len(cmd):
+            slug = _parse_repo_slug(cmd[i + 1])
+            if slug:
+                return slug
+        # Handle --repo=owner/repo
+        if arg.startswith("--repo="):
+            slug = _parse_repo_slug(arg.split("=", 1)[1])
+            if slug:
+                return slug
+        if arg.startswith("-R") and len(arg) > 2:
+            slug = _parse_repo_slug(arg[2:])
+            if slug:
+                return slug
+    return None
+
+
+def _detect_repo_slug_from_git_remote() -> str | None:
+    """Extract owner/repo slug from the current repo's origin remote."""
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -300,15 +303,39 @@ def _detect_org_from_git_remote() -> str | None:
         return None
 
     # SSH: git@github.com:owner/repo.git
-    m = re.match(r"git@github\.com:([^/]+)/", url)
+    m = re.match(r"git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$", url)
     if m:
-        return m.group(1).lower()
+        return f"{m.group(1).lower()}/{m.group(2).lower()}"
 
     # HTTPS: https://github.com/owner/repo.git
-    m = re.match(r"https?://github\.com/([^/]+)/", url)
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
     if m:
-        return m.group(1).lower()
+        return f"{m.group(1).lower()}/{m.group(2).lower()}"
 
+    return None
+
+
+def _detect_repo_slug(cmd: list[str]) -> str | None:
+    """Auto-detect owner/repo slug from command args, then git remote."""
+    slug = _detect_repo_slug_from_args(cmd)
+    if slug:
+        return slug
+    return _detect_repo_slug_from_git_remote()
+
+
+def _detect_org_from_args(cmd: list[str]) -> str | None:
+    """Extract org from -R/--repo owner/repo in gh command args."""
+    slug = _detect_repo_slug_from_args(cmd)
+    if slug and "/" in slug:
+        return slug.split("/")[0]
+    return None
+
+
+def _detect_org_from_git_remote() -> str | None:
+    """Extract org from the current repo's origin remote."""
+    slug = _detect_repo_slug_from_git_remote()
+    if slug and "/" in slug:
+        return slug.split("/")[0]
     return None
 
 
@@ -334,9 +361,10 @@ def _escape_for_powershell(s: str) -> str:
 
 
 def _run_gui(cmd: list[str]) -> int | None:
-    """Run a GUI command with timeout. Returns exit code, or None on failure.
+    """Run a GUI command with timeout. Returns exit code, or None if not found.
 
-    Properly kills the child process on timeout (subprocess.run doesn't).
+    Returns 1 (denial) on timeout — the user didn't respond in time.
+    Returns None only when the tool is not installed (FileNotFoundError).
     """
     _debug(f"gui: launching {cmd[0]}")
     try:
@@ -354,68 +382,92 @@ def _run_gui(cmd: list[str]) -> int | None:
         _debug(f"gui: {cmd[0]} exited with {proc.returncode}")
         return proc.returncode
     except subprocess.TimeoutExpired:
-        _debug(f"gui: {cmd[0]} timed out after {_GUI_TIMEOUT}s, killing")
+        _debug(f"gui: {cmd[0]} timed out after {_GUI_TIMEOUT}s, auto-denying")
         proc.kill()
         proc.wait()
-        return None
+        _info(f"Dialog timed out after {_GUI_TIMEOUT}s — auto-denied.")
+        return 1  # treat as denial, not as tool-unavailable
 
 
-def _format_approval_msg(cmd_str: str, org: str) -> str:
+def _format_approval_msg(cmd_str: str, org: str, repo: str | None = None) -> str:
+    target = f"Repository: {repo}" if repo else f"Organization: {org}"
     return (
         "A GitHub command requires elevated (write) permissions.\n\n"
-        f"Organization: {org}\n"
+        f"{target}\n"
         f"Command to execute:\n  {cmd_str}\n\n"
         "Allow this command to run with elevated GitHub permissions?"
     )
 
 
-def _ask_xmessage(cmd_str: str, org: str) -> bool | None:
+def _ask_xmessage(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
     """Lightweight X11 dialog. Returns True=approved, False=denied, None=unavailable."""
-    msg = _format_approval_msg(cmd_str, org)
-    rc = _run_gui([
-        "xmessage", "-center",
-        "-xrm", "*international:true",
-        "-xrm", "*form.message.Scroll:WhenNeeded",
-        "-xrm", "*form.minimumWidth:500",
-        "-buttons", "Allow:0,Deny:1",
-        "-default", "Deny", msg,
-    ])
+    msg = _format_approval_msg(cmd_str, org, repo)
+    rc = _run_gui(
+        [
+            "xmessage",
+            "-center",
+            "-xrm",
+            "*international:true",
+            "-xrm",
+            "*form.message.Scroll:WhenNeeded",
+            "-xrm",
+            "*form.minimumWidth:500",
+            "-buttons",
+            "Allow:0,Deny:1",
+            "-default",
+            "Deny",
+            msg,
+        ]
+    )
     if rc is None:
         return None
     return rc == 0
 
 
-def _ask_zenity(cmd_str: str, org: str) -> bool | None:
+def _ask_zenity(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
-    msg = _format_approval_msg(cmd_str, org)
-    rc = _run_gui([
-        "zenity", "--question",
-        "--title=GitHub Elevated Access (ghsudo)",
-        f"--text={msg}", "--width=500",
-        "--ok-label=Allow", "--cancel-label=Deny",
-    ])
+    msg = _format_approval_msg(cmd_str, org, repo)
+    rc = _run_gui(
+        [
+            "zenity",
+            "--question",
+            "--title=GitHub Elevated Access (ghsudo)",
+            f"--text={msg}",
+            "--width=500",
+            "--ok-label=Allow",
+            "--cancel-label=Deny",
+        ]
+    )
     if rc is None:
         return None  # not installed or timed out
     return rc == 0
 
 
-def _ask_kdialog(cmd_str: str, org: str) -> bool | None:
+def _ask_kdialog(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
-    msg = _format_approval_msg(cmd_str, org)
-    rc = _run_gui([
-        "kdialog", "--title", "GitHub Elevated Access (ghsudo)",
-        "--yesno", msg,
-        "--yes-label", "Allow", "--no-label", "Deny",
-    ])
+    msg = _format_approval_msg(cmd_str, org, repo)
+    rc = _run_gui(
+        [
+            "kdialog",
+            "--title",
+            "GitHub Elevated Access (ghsudo)",
+            "--yesno",
+            msg,
+            "--yes-label",
+            "Allow",
+            "--no-label",
+            "Deny",
+        ]
+    )
     if rc is None:
         return None
     return rc == 0
 
 
-def _ask_osascript(cmd_str: str, org: str) -> bool | None:
+def _ask_osascript(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     escaped = _escape_for_applescript(
-        _format_approval_msg(cmd_str, org).replace("\n", "\\n")
+        _format_approval_msg(cmd_str, org, repo).replace("\n", "\\n")
     )
     # "cancel button" makes Deny return exit code 1.
     script = (
@@ -430,17 +482,19 @@ def _ask_osascript(cmd_str: str, org: str) -> bool | None:
     return rc == 0
 
 
-def _ask_powershell(cmd_str: str, org: str) -> bool | None:
+def _ask_powershell(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     escaped = _escape_for_powershell(cmd_str)
+    raw_target = f"Repository: {repo}" if repo else f"Organization: {org}"
+    target = _escape_for_powershell(raw_target)
     ps = (
         "Add-Type -AssemblyName System.Windows.Forms; "
         "$r = [System.Windows.Forms.MessageBox]::Show("
-        f"\"A GitHub command requires elevated (write) permissions."
-        f"`n`nOrganization: {org}"
+        f'"A GitHub command requires elevated (write) permissions.'
+        f"`n`n{target}"
         f"`nCommand to execute:`n  {escaped}`n`n"
-        f"Allow this command to run with elevated GitHub permissions?\","
-        f"\"GitHub Elevated Access (ghsudo)\","
+        f'Allow this command to run with elevated GitHub permissions?",'
+        f'"GitHub Elevated Access (ghsudo)",'
         "[System.Windows.Forms.MessageBoxButtons]::YesNo,"
         "[System.Windows.Forms.MessageBoxIcon]::Warning); "
         'if ($r -eq "Yes") { exit 0 } else { exit 1 }'
@@ -449,19 +503,6 @@ def _ask_powershell(cmd_str: str, org: str) -> bool | None:
     if rc is None:
         return None
     return rc == 0
-
-
-def _ask_terminal(cmd_str: str, org: str) -> bool:
-    if not sys.stdin.isatty():
-        return False
-    _info("GitHub elevated access required.")
-    _info(f"Organization: {org}")
-    _info(f"Command: {cmd_str}")
-    try:
-        answer = input(f"{_PREFIX} Allow? (yes/no): ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return answer in ("yes", "y")
 
 
 def _has_display() -> bool:
@@ -475,38 +516,39 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _ask_approval(cmd_str: str, org: str, *, no_gui: bool = False) -> bool:
+def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
     """Ask the user to approve the command. Returns True if approved."""
     system = platform.system()
-    _debug(f"approval: system={system}, no_gui={no_gui}, has_display={_has_display()}")
+    _debug(f"approval: system={system}, has_display={_has_display()}")
 
-    if not no_gui and _has_display():
+    if _has_display():
         gui_result = None
         if system == "Linux":
             # Try lightest first: xmessage → zenity → kdialog
-            gui_result = _ask_xmessage(cmd_str, org)
+            gui_result = _ask_xmessage(cmd_str, org, repo)
             if gui_result is None:
-                gui_result = _ask_zenity(cmd_str, org)
+                gui_result = _ask_zenity(cmd_str, org, repo)
             if gui_result is None:
-                gui_result = _ask_kdialog(cmd_str, org)
+                gui_result = _ask_kdialog(cmd_str, org, repo)
         elif system == "Darwin":
-            gui_result = _ask_osascript(cmd_str, org)
+            gui_result = _ask_osascript(cmd_str, org, repo)
         elif system == "Windows":
-            gui_result = _ask_powershell(cmd_str, org)
+            gui_result = _ask_powershell(cmd_str, org, repo)
 
         # If a GUI tool gave a definitive answer, use it (no terminal re-ask)
         if gui_result is not None:
             return gui_result
 
-    # Terminal fallback (only reached if GUI unavailable/timed out)
-    if _ask_terminal(cmd_str, org):
-        return True
-
-    if not sys.stdin.isatty():
-        _err("Cannot request approval: no display and no terminal available.")
-        sys.exit(EXIT_NO_INTERACTIVE)
-
-    return False
+    # Cannot get user approval — either no display or no GUI toolkit found
+    if not _has_display():
+        _err("Cannot request approval: no graphical display available.")
+        _err("Ensure DISPLAY or WAYLAND_DISPLAY is set (e.g. ssh -X).")
+    else:
+        _err("Cannot request approval: no supported GUI dialog tool found.")
+        if system == "Linux":
+            _err("Install one of: xmessage, zenity, kdialog.")
+        _err("Display is available but no toolkit could show the dialog.")
+    sys.exit(EXIT_NO_INTERACTIVE)
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +653,7 @@ def cmd_setup(org: str) -> int:
     return EXIT_OK
 
 
-def cmd_run(cmd: list[str], *, org: str | None = None, no_gui: bool = False) -> int:
+def cmd_run(cmd: list[str], *, org: str | None = None) -> int:
     """Show approval dialog, then re-execute command with elevated token."""
     if not cmd:
         _err("No command specified.")
@@ -650,8 +692,12 @@ def cmd_run(cmd: list[str], *, org: str | None = None, no_gui: bool = False) -> 
 
     cmd_str = shlex.join(cmd)
 
+    # Detect full repo slug (owner/repo) for display in approval dialog
+    repo_slug = _detect_repo_slug(cmd)
+    _debug(f"repo_slug={repo_slug}")
+
     _debug("requesting approval")
-    if not _ask_approval(cmd_str, org, no_gui=no_gui):
+    if not _ask_approval(cmd_str, org, repo=repo_slug):
         _info("Permission denied by user.")
         return EXIT_DENIED
     _debug("approved, executing command")
@@ -791,7 +837,6 @@ Anything not prefixed with -- is the command to run:
 
 Options:
   --org ORG       Target org (auto-detected from -R flag or git remote)
-  --no-gui        Skip GUI dialog, use terminal prompt only
   --setup ORG     Store encrypted GitHub PAT for an org
   --verify [ORG]  Verify stored token(s)
   --revoke [ORG]  Revoke stored token(s)
@@ -809,7 +854,6 @@ def main() -> int:
 
     # Parse -- flags, collect the rest as the command
     org: str | None = None
-    no_gui = False
     cmd: list[str] = []
     i = 0
     while i < len(argv):
@@ -822,10 +866,18 @@ def main() -> int:
         elif arg == "--list":
             return cmd_list()
         elif arg == "--verify":
-            verify_org = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("--") else None
+            verify_org = (
+                argv[i + 1]
+                if i + 1 < len(argv) and not argv[i + 1].startswith("--")
+                else None
+            )
             return cmd_verify(verify_org)
         elif arg == "--revoke":
-            revoke_org = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("--") else None
+            revoke_org = (
+                argv[i + 1]
+                if i + 1 < len(argv) and not argv[i + 1].startswith("--")
+                else None
+            )
             return cmd_revoke(revoke_org)
         elif arg == "--org":
             if i + 1 >= len(argv):
@@ -834,17 +886,13 @@ def main() -> int:
             org = argv[i + 1]
             i += 2
             continue
-        elif arg == "--no-gui":
-            no_gui = True
-            i += 1
-            continue
         else:
             # Everything from here on is the command
             cmd = argv[i:]
             break
         i += 1
 
-    return cmd_run(cmd, org=org, no_gui=no_gui)
+    return cmd_run(cmd, org=org)
 
 
 if __name__ == "__main__":

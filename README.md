@@ -21,7 +21,7 @@ The naive solutions both have drawbacks:
 2. **Write token** — stored encrypted on your machine. When the agent needs to perform a write operation (a `gh` command that would otherwise fail with HTTP 403), it calls `ghsudo` instead.
 
 `ghsudo` then:
-- Shows you a **GUI popup** (or terminal prompt) listing the exact command to be executed.
+- Shows you a **GUI popup** listing the exact command to be executed.
 - **Waits for your explicit approval** before proceeding.
 - If approved, re-runs the command with the elevated write token injected into the environment.
 - If denied (or timed out after 60 s), exits with a non-zero code so the agent knows it was blocked.
@@ -42,7 +42,15 @@ cd ghsudo
 pip install .
 ```
 
+> **Note:** For `git push`/`pull` to work with `ghsudo`'s elevated token, your remotes need `https://` URLs (not SSH). `ghsudo` injects `GH_TOKEN`/`GITHUB_TOKEN` which the `gh` credential helper uses for HTTPS Git operations. (`ghsudo gh ...` commands work regardless of remote URL scheme.)
+> To configure `gh` as the Git credential helper, run:
+> ```bash
+> gh auth setup-git
+> ```
+
 **Requirement:** Python 3.10+
+
+> **Note:** Only **Linux** is actively tested. macOS and Windows have basic support (GUI dialogs, path handling) but are **not tested** — contributions welcome.
 
 ## Quick Start
 
@@ -181,7 +189,6 @@ GitHub Sudo — re-execute commands with per-org elevated tokens.
 
 Options:
   --org ORG       Target org (auto-detected from -R flag or git remote)
-  --no-gui        Skip GUI dialog, use terminal prompt only
   --setup ORG     Store encrypted GitHub PAT for an org
   --verify [ORG]  Verify stored token(s)
   --revoke [ORG]  Revoke stored token(s)
@@ -211,7 +218,9 @@ On **Linux**, `ghsudo` tries (in order): `xmessage`, `zenity`, `kdialog`.
 On **macOS**, it uses `osascript` (the built-in AppleScript runner).  
 On **Windows**, it uses PowerShell's `MessageBox`.
 
-If no GUI is available (e.g. headless server), it falls back to a terminal prompt. Use `--no-gui` to force terminal-only mode.
+A graphical display is **required** — `ghsudo` will refuse to run without one, because a terminal prompt can be trivially auto-approved by an AI agent, defeating the purpose. If no GUI toolkit is found, `ghsudo` exits with code 3.
+
+> **Tip:** If you run your agent on a remote machine via SSH, use `ssh -X` (X11 forwarding) so that `ghsudo` GUI dialogs appear on your local display.
 
 The dialog auto-denies after **60 seconds** of no response to prevent the agent from hanging indefinitely.
 
@@ -238,7 +247,7 @@ The dialog auto-denies after **60 seconds** of no response to prevent the agent 
 | 0 | Success |
 | 1 | Error |
 | 2 | User denied the request |
-| 3 | No interactive session available to ask for approval |
+| 3 | No graphical display available, or no supported GUI dialog tool found |
 | 4 | No token stored for the target org |
 
 ## Debugging
