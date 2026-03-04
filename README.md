@@ -44,6 +44,8 @@ pip install .
 
 **Requirement:** Python 3.10+
 
+> **Note:** Only **Linux** is actively tested. macOS and Windows have basic support (GUI dialogs, path handling) but are **not tested** — contributions welcome.
+
 ## Quick Start
 
 ```bash
@@ -212,6 +214,8 @@ On **macOS**, it uses `osascript` (the built-in AppleScript runner).
 On **Windows**, it uses PowerShell's `MessageBox`.
 
 If no GUI is available (e.g. headless server), it falls back to a terminal prompt. Use `--no-gui` to force terminal-only mode.
+
+> **Tip:** If you run your agent on a remote machine via SSH, use `ssh -X` (X11 forwarding) so that `ghsudo` GUI dialogs appear on your local display.
 
 The dialog auto-denies after **60 seconds** of no response to prevent the agent from hanging indefinitely.
 
