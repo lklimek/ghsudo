@@ -352,9 +352,10 @@ def _escape_for_powershell(s: str) -> str:
 
 
 def _run_gui(cmd: list[str]) -> int | None:
-    """Run a GUI command with timeout. Returns exit code, or None on failure.
+    """Run a GUI command with timeout. Returns exit code, or None if not found.
 
-    Properly kills the child process on timeout (subprocess.run doesn't).
+    Returns 1 (denial) on timeout — the user didn't respond in time.
+    Returns None only when the tool is not installed (FileNotFoundError).
     """
     _debug(f"gui: launching {cmd[0]}")
     try:
@@ -372,10 +373,11 @@ def _run_gui(cmd: list[str]) -> int | None:
         _debug(f"gui: {cmd[0]} exited with {proc.returncode}")
         return proc.returncode
     except subprocess.TimeoutExpired:
-        _debug(f"gui: {cmd[0]} timed out after {_GUI_TIMEOUT}s, killing")
+        _debug(f"gui: {cmd[0]} timed out after {_GUI_TIMEOUT}s, auto-denying")
         proc.kill()
         proc.wait()
-        return None
+        _info(f"Dialog timed out after {_GUI_TIMEOUT}s — auto-denied.")
+        return 1  # treat as denial, not as tool-unavailable
 
 
 def _format_approval_msg(cmd_str: str, org: str, repo: str | None = None) -> str:

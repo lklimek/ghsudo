@@ -21,7 +21,7 @@ The naive solutions both have drawbacks:
 2. **Write token** — stored encrypted on your machine. When the agent needs to perform a write operation (a `gh` command that would otherwise fail with HTTP 403), it calls `ghsudo` instead.
 
 `ghsudo` then:
-- Shows you a **GUI popup** (or terminal prompt) listing the exact command to be executed.
+- Shows you a **GUI popup** listing the exact command to be executed.
 - **Waits for your explicit approval** before proceeding.
 - If approved, re-runs the command with the elevated write token injected into the environment.
 - If denied (or timed out after 60 s), exits with a non-zero code so the agent knows it was blocked.
@@ -42,8 +42,8 @@ cd ghsudo
 pip install .
 ```
 
-> **Note:** Git remotes **must** use `https://` URLs (not SSH). `ghsudo` injects the elevated token via `GH_TOKEN`/`GITHUB_TOKEN` environment variables, which only work with HTTPS remotes.
-> To make `git` use `gh` as its credential helper (so `git push`/`pull` work over HTTPS), run:
+> **Note:** For `git push`/`pull` to work with `ghsudo`'s elevated token, your remotes need `https://` URLs (not SSH). `ghsudo` injects `GH_TOKEN`/`GITHUB_TOKEN` which the `gh` credential helper uses for HTTPS Git operations. (`ghsudo gh ...` commands work regardless of remote URL scheme.)
+> To configure `gh` as the Git credential helper, run:
 > ```bash
 > gh auth setup-git
 > ```
@@ -247,7 +247,7 @@ The dialog auto-denies after **60 seconds** of no response to prevent the agent 
 | 0 | Success |
 | 1 | Error |
 | 2 | User denied the request |
-| 3 | No graphical display available to show approval dialog |
+| 3 | No graphical display available, or no supported GUI dialog tool found |
 | 4 | No token stored for the target org |
 
 ## Debugging
