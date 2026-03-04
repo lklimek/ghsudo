@@ -31,6 +31,12 @@ The write token never appears in agent context or logs — it is encrypted at re
 ## Installation
 
 ```bash
+pipx install ghsudo
+```
+
+Or with pip:
+
+```bash
 pip install ghsudo
 ```
 
@@ -56,7 +62,7 @@ pip install .
 
 ```bash
 # 1. Install
-pip install ghsudo
+pipx install ghsudo
 
 # 2. Create a write-access GitHub PAT at https://github.com/settings/tokens
 #    (classic PAT with 'repo' scope, or fine-grained with the permissions you need)
@@ -100,7 +106,7 @@ The key idea: give the agent a read-only token, and instruct it to use `ghsudo` 
 #### 1. Install ghsudo on your machine
 
 ```bash
-pip install ghsudo
+pipx install ghsudo
 ```
 
 #### 2. Create a write-access GitHub PAT and store it
