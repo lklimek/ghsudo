@@ -28,64 +28,52 @@ The naive solutions both have drawbacks:
 
 The write token never appears in agent context or logs — it is encrypted at rest using AES-256-GCM with a key derived from machine-specific identifiers (machine ID, hostname, username).
 
-## Installation
-
-```bash
-pipx install ghsudo
-```
-
-Or with pip:
-
-```bash
-pip install ghsudo
-```
-
-Or install from source:
-
-```bash
-git clone https://github.com/lklimek/ghsudo
-cd ghsudo
-pip install .
-```
-
-> **Note:** For `git push`/`pull` to work with `ghsudo`'s elevated token, your remotes need `https://` URLs (not SSH). `ghsudo` injects `GH_TOKEN`/`GITHUB_TOKEN` which the `gh` credential helper uses for HTTPS Git operations. (`ghsudo gh ...` commands work regardless of remote URL scheme.)
-> To configure `gh` as the Git credential helper, run:
-> ```bash
-> gh auth setup-git
-> ```
+## Installation and agent setup
 
 **Requirement:** Python 3.10+
 
-> **Note:** Only **Linux** is actively tested. macOS and Windows have basic support (GUI dialogs, path handling) but are **not tested** — contributions welcome.
-
-## Quick Start
+Install with `pipx` (recommended), `pip`, or from source:
 
 ```bash
-# 1. Install
 pipx install ghsudo
-
-# 2. Create a write-access GitHub PAT at https://github.com/settings/tokens
-#    (classic PAT with 'repo' scope, or fine-grained with the permissions you need)
-
-# 3. Store the write token — <org> is the GitHub organization or user account
-#    that owns the repo (e.g. 'mycompany' for mycompany/myapp, or your username)
-ghsudo --setup <org>
-
-# 4. Give the agent a read-only token — log in with a separate read-only PAT
-#    so the agent's gh commands are restricted by default
-echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
-# Alternatively, use an environment variable (session-scoped):
-# export GH_TOKEN=<your-read-only-token>
-
-# 5. Add CLAUDE.md / AGENTS.md to your repo (see below)
+# or: pip install ghsudo
+# or:
+#   git clone https://github.com/lklimek/ghsudo
+#   cd ghsudo
+#   pip install .
 ```
 
-> **⚠️ Important:** Run the agent in a **dedicated terminal** (or subshell) where
-> your `gh` is authenticated with the read-only token above. Do **not** launch the agent
-> in a session where your real, writable `gh auth login` is active — this would give
-> the agent full write access and bypass ghsudo's read-only restriction.
+> **Note:** For `git push`/`pull` to work with `ghsudo`'s elevated token, use `https://` remotes (not SSH), then configure `gh` as the Git credential helper:
+> ```bash
+> gh auth setup-git
+> ```
+> `ghsudo gh ...` commands work regardless of remote URL scheme.
+>
+> **Platform note:** Only **Linux** is actively tested. macOS and Windows have basic support but are untested.
 
-When the agent needs to perform a write operation, it calls:
+Set up once per GitHub owner (`<org>` = the owner in `owner/repo`):
+
+1. Create a write PAT at [GitHub token settings](https://github.com/settings/tokens) and store it:
+   ```bash
+   ghsudo --setup <org>
+   ```
+2. Configure your coding agent to use a separate read-only token:
+   ```bash
+   echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
+   # or (session-scoped): export GH_TOKEN=<your-read-only-token>
+   ```
+3. Add agent instructions in each target repository:
+   - Claude Code: copy [`CLAUDE-example.md`](CLAUDE-example.md) to `CLAUDE.md`
+   - OpenAI Codex: copy [`AGENTS-example.md`](AGENTS-example.md) to `AGENTS.md`
+4. Verify:
+   ```bash
+   ghsudo --verify <org>
+   ghsudo --list
+   ```
+
+> **⚠️ Important:** Run the agent in a dedicated terminal/subshell where `gh` is authenticated with the read-only token. Otherwise the agent may inherit your writable `gh` credentials and bypass `ghsudo`.
+
+For write operations, the agent must use:
 
 ```bash
 ghsudo gh pr merge 123 --merge
@@ -93,96 +81,7 @@ ghsudo gh issue comment 42 --body "Done!"
 ghsudo gh pr review 7 --approve
 ```
 
-A dialog appears asking you to approve. Only after you click **Allow** does the command run.
-
-See [Setting up with your agent](#setting-up-with-your-agent) for a detailed walk-through.
-
-## Setting up with your agent
-
-The key idea: give the agent a read-only token, and instruct it to use `ghsudo` for write operations. A `CLAUDE.md` / `AGENTS.md` file in the target repository carries those instructions into the agent's context automatically.
-
-### Step-by-step
-
-#### 1. Install ghsudo on your machine
-
-```bash
-pipx install ghsudo
-```
-
-#### 2. Create a write-access GitHub PAT and store it
-
-Go to [GitHub Settings → Developer Settings → Personal access tokens](https://github.com/settings/tokens) and generate a new token with the write scopes you need (e.g. the `repo` scope for a classic PAT, or the relevant fine-grained permissions).
-
-Then store it with `ghsudo`:
-
-```bash
-ghsudo --setup <org>
-```
-
-`<org>` is the GitHub organization or personal user account name that owns the repositories you work with — the owner part of an `owner/repo` pair. For example, for `mycompany/myapp` use `mycompany`; for your own repos use your GitHub username.
-
-You will be prompted to paste your [GitHub Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens). The token is validated and stored encrypted under `~/.config/ghsudo/tokens/<org>.enc`.
-
-#### 3. Give the agent a read-only token
-
-Create a separate PAT with **only read scopes** (fine-grained PAT with read-only permissions, or classic PAT with only `read:org` / `public_repo`), then configure it for the agent.
-
-**Recommended — `gh auth login` (persistent across all gh commands in the session):**
-
-```bash
-echo "<your-read-only-token>" | gh auth login --hostname github.com --with-token
-```
-
-This stores the token as the active GitHub credential for the `gh` CLI. All `gh` read operations in that session will use it, and write operations will fail (prompting the agent to use `ghsudo`).
-
-**Alternative — environment variable (session-scoped):**
-
-```bash
-export GH_TOKEN=<your-read-only-token>
-```
-
-`GH_TOKEN` takes precedence over `gh auth login` credentials, so setting it achieves the same restriction for the duration of the shell session.
-
-> **⚠️ Warning:** Do **not** launch the agent in a terminal where your real, writable
-> `gh auth login` is active without setting `GH_TOKEN`. If no `GH_TOKEN` or
-> `GITHUB_TOKEN` is set, the agent inherits your personal GitHub credentials (which
-> may have full write access), bypassing ghsudo's read-only restriction. Use a dedicated
-> terminal or subshell for the agent session.
-
-#### 4. Add agent instructions to your repository
-
-Copy the provided template files into the root of each repository where the agent will work:
-
-**For Claude Code** — copy [`CLAUDE-example.md`](CLAUDE-example.md) as `CLAUDE.md` in your repo (or append its contents to an existing `CLAUDE.md`):
-
-```markdown
-# GitHub access — two-token model
-
-You have been given a **read-only** GitHub token via `GH_TOKEN` / `GITHUB_TOKEN`.
-Use it freely for all read operations.
-
-For any GitHub operation that **modifies** state (merge, push, comment, label,
-close, approve, request review, etc.), prefix the command with `ghsudo`:
-
-    ghsudo gh pr merge 123 --merge
-    ghsudo gh issue comment 42 --body "Done!"
-    ghsudo gh pr review 7 --approve
-
-`ghsudo` will show the user a dialog and wait for explicit approval before running
-the command with elevated permissions. If denied (exit code 2), stop and report
-to the user. Never bypass ghsudo or ask the user for the write token directly.
-```
-
-**For OpenAI Codex** — copy [`AGENTS-example.md`](AGENTS-example.md) as `AGENTS.md` in your repo (the file name `AGENTS.md` is the convention Codex uses).
-
-The [`CLAUDE-example.md`](CLAUDE-example.md) and [`AGENTS-example.md`](AGENTS-example.md) files in *this* repository serve as ready-to-copy templates.
-
-#### 5. Verify the setup
-
-```bash
-ghsudo --verify <org>   # confirms the token decrypts and is accepted by GitHub
-ghsudo --list           # shows all orgs with stored tokens
-```
+`ghsudo` shows a GUI approval dialog and only runs the command after you click **Allow**.
 
 ## Usage
 
