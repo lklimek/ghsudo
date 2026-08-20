@@ -1,6 +1,6 @@
 # Design: ntfy.sh notification channel
 
-Status: DECIDED — ready for implementation.
+Status: IMPLEMENTED in v0.3.0 — see "As implemented" at the end.
 
 ## Goal
 
@@ -258,3 +258,29 @@ is a settled decision rather than an open question:
    to `ghsudo --setup`'s output / the README GH-token section, not just the
    new ntfy section — this is a pre-existing property, now documented
    consistently in both places.
+
+## As implemented (v0.3.0)
+
+Deltas from the sketch above, all in the same spirit:
+
+1. **Config plaintext is JSON, not TOML** — `tomllib` is read-only, so writing
+   TOML would need a third-party writer for no benefit. File location,
+   encryption and permissions are as designed (`~/.config/ghsudo/notify.enc`,
+   AES-256-GCM via the shared `_encrypt_blob`/`_decrypt_blob`, `0600`).
+2. **Env overrides can never select remote-approve.** If any of
+   `GHSUDO_NTFY_SERVER` / `GHSUDO_NTFY_TOPIC` / `GHSUDO_NTFY_MODE` is set, the
+   effective mode is forced to `notify`. The agent invoking `ghsudo` controls
+   its child environment, so an env-selectable approval channel would let it
+   point `ghsudo` at a topic it owns and approve itself — cheaper than the
+   crypto-reproduction attack the Decision section accepts, so it is closed.
+3. **Subscribe before publish.** The reply-topic stream is opened *before* the
+   notification goes out, so a reply tapped the instant the push lands cannot
+   arrive before anyone is listening.
+4. **Publishing uses ntfy's JSON API** rather than headers: command strings can
+   contain newlines and non-ASCII, which HTTP headers cannot carry.
+5. **When both channels race, the GUI dialog's timeout is raised** to the ntfy
+   timeout, so the 60s dialog deadline cannot auto-deny while the phone can
+   still answer.
+6. Channel contract, symmetric for both channels: `None` = could not reach the
+   user, `False` = denied *including its own timeout*, `True` = approved. With
+   no channel able to answer, `EXIT_NO_INTERACTIVE` is preserved unchanged.

@@ -13,6 +13,7 @@ Token is stored AES-256-GCM encrypted, keyed to machine characteristics.
 
 from __future__ import annotations
 
+import functools
 import getpass
 import hashlib
 import os
@@ -22,7 +23,10 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -38,8 +42,36 @@ _GUI_TIMEOUT = 60  # seconds — dialog auto-denies if user doesn't respond
 
 _CONFIG_DIR = Path.home() / ".config" / "ghsudo"
 _TOKENS_DIR = _CONFIG_DIR / "tokens"
+_NOTIFY_PATH = _CONFIG_DIR / "notify.enc"
 
 _README_URL = "https://github.com/lklimek/ghsudo#readme"
+_USER_AGENT = "ghsudo/1.0"
+
+_MACHINE_KEY_NOTE = (
+    "Note: the encryption key is derived from this machine's identifiers, so "
+    "code running as you can re-derive it. It protects stolen disks and stray "
+    "backups, not this machine."
+)
+
+# ntfy notification channel
+_MODE_NOTIFY = "notify"
+_MODE_REMOTE_APPROVE = "remote-approve"
+_NTFY_MODES = (_MODE_NOTIFY, _MODE_REMOTE_APPROVE)
+_NTFY_DEFAULT_SERVER = "https://ntfy.sh"
+_NTFY_DEFAULT_TIMEOUT = 300  # seconds — a phone reply is slower than a click
+_NTFY_MAX_TIMEOUT = 3600
+_NTFY_PUBLISH_TIMEOUT = 10
+_NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_NTFY_ENV_OVERRIDES = {
+    "server": "GHSUDO_NTFY_SERVER",
+    "topic": "GHSUDO_NTFY_TOPIC",
+    "mode": "GHSUDO_NTFY_MODE",
+}
+_REPLY_ALLOW = "allow"
+_REPLY_DENY = "deny"
+_REPLY_TOPIC_BYTES = 24
+_CANCEL_POLL_INTERVAL = 0.2  # seconds between cancellation checks while a dialog is up
+_RACE_SLACK = 5  # seconds the race waits past a channel's own deadline
 
 # Exit codes
 EXIT_OK = 0
@@ -130,8 +162,13 @@ def _get_machine_id() -> str | None:
     return None
 
 
+@functools.cache
 def _derive_machine_key() -> bytes:
-    """Derive a 32-byte AES-256 key from stable machine identifiers."""
+    """Derive a 32-byte AES-256 key from stable machine identifiers.
+
+    Cached: the 600k-iteration KDF is deterministic and several call sites
+    (token store, ntfy config) need the key within one run.
+    """
     _debug("deriving machine key")
     components: list[str] = []
 
@@ -170,20 +207,20 @@ def _require_cryptography():
         sys.exit(EXIT_ERROR)
 
 
-def _encrypt_token(token: str, key: bytes) -> bytes:
+def _encrypt_blob(plaintext: str, key: bytes) -> bytes:
     AESGCM = _require_cryptography()
     nonce = os.urandom(_NONCE_LEN)
-    ct = AESGCM(key).encrypt(nonce, token.encode("utf-8"), None)
+    ct = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
     return _VERSION_BYTE + nonce + ct
 
 
-def _decrypt_token(data: bytes, key: bytes) -> str:
+def _decrypt_blob(data: bytes, key: bytes) -> str:
     AESGCM = _require_cryptography()
     if len(data) < 1 + _NONCE_LEN + 1:
-        raise ValueError("Token file is too short or corrupted")
+        raise ValueError("Encrypted file is too short or corrupted")
     version = data[0:1]
     if version != _VERSION_BYTE:
-        raise ValueError(f"Unknown token format version: {version!r}")
+        raise ValueError(f"Unknown encrypted format version: {version!r}")
     nonce = data[1 : 1 + _NONCE_LEN]
     ct = data[1 + _NONCE_LEN :]
     return AESGCM(key).decrypt(nonce, ct, None).decode("utf-8")
@@ -219,7 +256,7 @@ def _list_orgs() -> list[str]:
 
 def _save_token(org: str, token: str) -> None:
     key = _derive_machine_key()
-    blob = _encrypt_token(token, key)
+    blob = _encrypt_blob(token, key)
     _TOKENS_DIR.mkdir(parents=True, exist_ok=True)
     path = _token_path(org)
     path.write_bytes(blob)
@@ -246,7 +283,7 @@ def _load_token(org: str) -> str:
     key = _derive_machine_key()
     data = path.read_bytes()
     try:
-        return _decrypt_token(data, key)
+        return _decrypt_blob(data, key)
     except Exception:  # noqa: BLE001
         _err(f"Failed to decrypt token for org '{org}'.")
         _err("Was it stored on a different machine, or did the hostname change?")
@@ -348,6 +385,421 @@ def _detect_org(cmd: list[str]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# ntfy notification channel
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _NtfyConfig:
+    """Settings for the ntfy channel, stored encrypted at rest."""
+
+    topic: str
+    server: str = _NTFY_DEFAULT_SERVER
+    mode: str = _MODE_NOTIFY
+    auth_token: str | None = None
+    timeout: int = _NTFY_DEFAULT_TIMEOUT
+    enabled: bool = True
+
+
+def _normalize_server(server: str) -> str | None:
+    """Return *server* without a trailing slash, or None if it is not http(s)."""
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    server = server.strip().rstrip("/")
+    parts = urlsplit(server)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    return server
+
+
+def _generate_ntfy_topic() -> str:
+    """Return a fresh, unguessable topic name."""
+    import secrets  # noqa: PLC0415
+
+    return f"ghsudo-{secrets.token_hex(8)}"
+
+
+def _build_ntfy_config(data: dict, *, env_used: bool) -> _NtfyConfig | None:
+    """Validate a raw settings mapping into a config, or None if unusable.
+
+    Anything unrecognised is coerced towards the safe end: an unknown mode
+    becomes ``notify``, and env-sourced settings can never yield remote-approve.
+    """
+    topic = str(data.get("topic") or "").strip()
+    if not _NTFY_TOPIC_RE.match(topic):
+        _debug(f"ntfy: invalid topic {topic!r} — ignoring configuration")
+        return None
+
+    server = _normalize_server(str(data.get("server") or _NTFY_DEFAULT_SERVER))
+    if server is None:
+        _debug("ntfy: server must be an http(s) URL — ignoring configuration")
+        return None
+
+    mode = str(data.get("mode") or _MODE_NOTIFY).strip()
+    if mode not in _NTFY_MODES:
+        _debug(f"ntfy: unknown mode {mode!r} — falling back to {_MODE_NOTIFY}")
+        mode = _MODE_NOTIFY
+    if env_used and mode == _MODE_REMOTE_APPROVE:
+        _info(
+            f"ntfy: {' / '.join(_NTFY_ENV_OVERRIDES.values())} can only drive "
+            f"notifications; using mode '{_MODE_NOTIFY}'."
+        )
+        mode = _MODE_NOTIFY
+
+    try:
+        timeout = int(data.get("timeout", _NTFY_DEFAULT_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = _NTFY_DEFAULT_TIMEOUT
+    if not 1 <= timeout <= _NTFY_MAX_TIMEOUT:
+        timeout = _NTFY_DEFAULT_TIMEOUT
+
+    auth_token = data.get("auth_token") or None
+    return _NtfyConfig(
+        topic=topic,
+        server=server,
+        mode=mode,
+        auth_token=str(auth_token) if auth_token else None,
+        timeout=timeout,
+        enabled=bool(data.get("enabled", True)),
+    )
+
+
+def _load_ntfy_config() -> _NtfyConfig | None:
+    """Return the effective ntfy config, or None when not configured.
+
+    Environment overrides are honoured for server/topic/mode, but any of them
+    forces notify mode: the agent that invokes ghsudo controls its environment,
+    so an env-selectable approval channel would let it approve itself.
+    """
+    import json  # noqa: PLC0415
+
+    data: dict = {}
+    if _NOTIFY_PATH.exists():
+        try:
+            raw = _decrypt_blob(_NOTIFY_PATH.read_bytes(), _derive_machine_key())
+            data = json.loads(raw)
+        except Exception as exc:  # noqa: BLE001 — never break a run over notifications
+            _err(f"Failed to read {_NOTIFY_PATH} ({exc}).")
+            _err("Re-run:  ghsudo --setup-ntfy")
+            return None
+        if not isinstance(data, dict):
+            _debug("ntfy: config is not a JSON object — ignoring")
+            return None
+
+    env = {
+        field: os.environ[var]
+        for field, var in _NTFY_ENV_OVERRIDES.items()
+        if os.environ.get(var)
+    }
+    if not data and not env:
+        return None
+
+    cfg = _build_ntfy_config({**data, **env}, env_used=bool(env))
+    if cfg is None or not cfg.enabled:
+        return None
+    return cfg
+
+
+def _save_ntfy_config(cfg: _NtfyConfig) -> None:
+    """Write the config encrypted, readable only by this user."""
+    import json  # noqa: PLC0415
+
+    blob = _encrypt_blob(json.dumps(asdict(cfg)), _derive_machine_key())
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _NOTIFY_PATH.write_bytes(blob)
+    try:
+        _NOTIFY_PATH.chmod(0o600)
+    except OSError:
+        pass  # Windows — rely on user-profile ACLs
+
+
+def _ntfy_headers(cfg: _NtfyConfig) -> dict[str, str]:
+    headers = {"User-Agent": _USER_AGENT}
+    if cfg.auth_token:
+        headers["Authorization"] = f"Bearer {cfg.auth_token}"
+    return headers
+
+
+def _ntfy_publish(
+    cfg: _NtfyConfig,
+    *,
+    topic: str,
+    title: str,
+    message: str,
+    actions: list[dict] | None = None,
+    tags: str | None = None,
+    priority: int | None = None,
+) -> bool:
+    """Publish one notification. Returns False on any delivery failure.
+
+    Uses ntfy's JSON API rather than headers so that command text with newlines
+    or non-ASCII characters survives intact.
+    """
+    import json  # noqa: PLC0415
+    from urllib.request import Request, urlopen  # noqa: PLC0415
+
+    payload: dict = {"topic": topic, "title": title, "message": message}
+    if actions:
+        payload["actions"] = actions
+    if tags:
+        payload["tags"] = tags
+    if priority:
+        payload["priority"] = priority
+
+    try:
+        req = Request(  # noqa: S310 — scheme validated by _normalize_server
+            cfg.server,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", **_ntfy_headers(cfg)},
+        )
+        with urlopen(req, timeout=_NTFY_PUBLISH_TIMEOUT) as resp:  # noqa: S310
+            status = getattr(resp, "status", 200)
+    except (OSError, ValueError) as exc:  # URLError/HTTPError are OSError subclasses
+        _debug(f"ntfy: publish to '{topic}' failed: {exc}")
+        return False
+    if not 200 <= status < 300:
+        _debug(f"ntfy: publish to '{topic}' returned HTTP {status}")
+        return False
+    _debug(f"ntfy: published to '{topic}'")
+    return True
+
+
+def _format_ntfy_message(cmd_str: str, org: str, repo: str | None) -> str:
+    target = f"Repository: {repo}" if repo else f"Organization: {org}"
+    return f"{target}\nCommand: {cmd_str}"
+
+
+def _notify_async(
+    cfg: _NtfyConfig, cmd_str: str, org: str, repo: str | None
+) -> threading.Thread:
+    """Send a heads-up push in the background, never blocking the approval flow."""
+
+    def _send() -> None:
+        try:
+            _ntfy_publish(
+                cfg,
+                topic=cfg.topic,
+                title="ghsudo: elevated GitHub access requested",
+                message=_format_ntfy_message(cmd_str, org, repo),
+                tags="key",
+                priority=4,
+            )
+        except Exception as exc:  # noqa: BLE001 — a heads-up must never break a run
+            _debug(f"ntfy: notification failed: {exc}")
+
+    thread = threading.Thread(target=_send, daemon=True)
+    thread.start()
+    return thread
+
+
+def _ntfy_reply_actions(cfg: _NtfyConfig, reply_topic: str) -> list[dict]:
+    """Build the Allow/Deny notification buttons that post to *reply_topic*."""
+    url = f"{cfg.server}/{reply_topic}"
+
+    def _action(label: str, body: str) -> dict:
+        action = {
+            "action": "http",
+            "label": label,
+            "url": url,
+            "method": "POST",
+            "body": body,
+            "clear": True,
+        }
+        if cfg.auth_token:
+            action["headers"] = {"Authorization": f"Bearer {cfg.auth_token}"}
+        return action
+
+    return [_action("Allow", _REPLY_ALLOW), _action("Deny", _REPLY_DENY)]
+
+
+def _parse_ntfy_reply(raw: bytes) -> bool | None:
+    """Decode one line of the reply stream: True/False for allow/deny, else None."""
+    import json  # noqa: PLC0415
+
+    if not raw.strip():
+        return None
+    try:
+        event = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _debug("ntfy: ignoring malformed line in reply stream")
+        return None
+    if not isinstance(event, dict) or event.get("event") != "message":
+        return None
+
+    body = str(event.get("message", "")).strip().lower()
+    if body == _REPLY_ALLOW:
+        return True
+    if body == _REPLY_DENY:
+        return False
+    _debug(f"ntfy: ignoring unrecognised reply {body!r}")
+    return None
+
+
+class _NtfyChannel:
+    """Approval over ntfy: push Allow/Deny buttons, then await the tapped reply.
+
+    ``run()`` returns True/False for an explicit answer, or None when the
+    channel could not reach the user at all; an expired timeout counts as a
+    denial, matching the GUI dialog.
+    """
+
+    def __init__(
+        self, cfg: _NtfyConfig, cmd_str: str, org: str, repo: str | None
+    ) -> None:
+        self._cfg = cfg
+        self._cmd_str = cmd_str
+        self._org = org
+        self._repo = repo
+        self._lock = threading.Lock()
+        self._stream = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Abandon the wait, unblocking a reader parked on the reply stream."""
+        with self._lock:
+            self._cancelled = True
+            stream = self._stream
+        if stream is not None:
+            _debug("ntfy: cancelling reply stream")
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def run(self) -> bool | None:
+        import secrets  # noqa: PLC0415
+        from urllib.request import Request, urlopen  # noqa: PLC0415
+
+        reply_topic = f"ghsudo-{secrets.token_urlsafe(_REPLY_TOPIC_BYTES)}"
+
+        # Subscribe before publishing: a reply tapped the instant the push
+        # lands would otherwise arrive before anyone is listening.
+        try:
+            req = Request(  # noqa: S310 — scheme validated by _normalize_server
+                f"{self._cfg.server}/{reply_topic}/json",
+                headers=_ntfy_headers(self._cfg),
+            )
+            stream = urlopen(req, timeout=self._cfg.timeout)  # noqa: S310
+        except (OSError, ValueError) as exc:
+            _debug(f"ntfy: cannot open reply stream: {exc}")
+            return None
+
+        with self._lock:
+            if self._cancelled:
+                stream.close()
+                return None
+            self._stream = stream
+
+        try:
+            return self._await_reply(stream, reply_topic)
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _await_reply(self, stream, reply_topic: str) -> bool | None:
+        if not _ntfy_publish(
+            self._cfg,
+            topic=self._cfg.topic,
+            title="ghsudo: approve elevated GitHub access?",
+            message=_format_ntfy_message(self._cmd_str, self._org, self._repo),
+            actions=_ntfy_reply_actions(self._cfg, reply_topic),
+            tags="closed_lock_with_key",
+            priority=5,
+        ):
+            _err("ntfy: could not send the approval request.")
+            return None
+
+        _info(
+            f"ntfy: approval request sent to '{self._cfg.topic}' "
+            f"(waiting up to {self._cfg.timeout}s)"
+        )
+        deadline = time.monotonic() + self._cfg.timeout
+        timed_out = False
+        try:
+            for line in stream:
+                if self._cancelled:
+                    return None
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                answer = _parse_ntfy_reply(line)
+                if answer is not None:
+                    _info(f"ntfy: reply received — {'allowed' if answer else 'denied'}")
+                    return answer
+        except TimeoutError:
+            timed_out = True
+        except Exception as exc:  # noqa: BLE001 — a broken stream must not crash
+            if self._cancelled:
+                return None
+            _debug(f"ntfy: reply stream failed: {exc}")
+            return None
+
+        if self._cancelled:
+            return None
+        if timed_out or time.monotonic() >= deadline:
+            _info(f"ntfy: no reply after {self._cfg.timeout}s — auto-denied.")
+            return False
+        _debug("ntfy: reply stream closed before an answer arrived")
+        return None
+
+
+# (name, run, cancel) — ``run`` answers True/False or None when it cannot decide.
+_Channel = tuple[str, Callable[[], bool | None], Callable[[], None]]
+
+
+def _race_approval(
+    channels: list[_Channel],
+    timeout: float,
+) -> bool | None:
+    """Return the first decisive answer from *channels*, cancelling the losers.
+
+    Each channel is a ``(name, run, cancel)`` triple where ``run()`` yields
+    True/False, or None when that channel could not decide.
+    """
+    import queue  # noqa: PLC0415
+
+    if not channels:
+        return None
+
+    results: queue.SimpleQueue = queue.SimpleQueue()
+
+    def _worker(name: str, run: Callable[[], bool | None]) -> None:
+        try:
+            results.put((name, run()))
+        except Exception as exc:  # noqa: BLE001 — one broken channel must not stall
+            _debug(f"approval: channel '{name}' failed: {exc}")
+            results.put((name, None))
+
+    for name, run, _cancel in channels:
+        threading.Thread(target=_worker, args=(name, run), daemon=True).start()
+
+    deadline = time.monotonic() + timeout
+    winner: str | None = None
+    answer: bool | None = None
+    for _ in channels:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            name, result = results.get(timeout=remaining)
+        except queue.Empty:
+            break
+        if result is not None:
+            winner, answer = name, result
+            _debug(f"approval: '{name}' decided: {answer}")
+            break
+        _debug(f"approval: channel '{name}' could not reach the user")
+
+    for name, _run, cancel in channels:
+        if name != winner:
+            cancel()
+    return answer
+
+
+# ---------------------------------------------------------------------------
 # GUI approval dialogs
 # ---------------------------------------------------------------------------
 
@@ -360,11 +812,17 @@ def _escape_for_powershell(s: str) -> str:
     return s.replace("`", "``").replace('"', '`"').replace("$", "`$")
 
 
-def _run_gui(cmd: list[str]) -> int | None:
+def _run_gui(
+    cmd: list[str],
+    *,
+    timeout: int = _GUI_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> int | None:
     """Run a GUI command with timeout. Returns exit code, or None if not found.
 
     Returns 1 (denial) on timeout — the user didn't respond in time.
-    Returns None only when the tool is not installed (FileNotFoundError).
+    Returns None when the tool is not installed, or when *cancel* is set
+    because another approval channel answered first.
     """
     _debug(f"gui: launching {cmd[0]}")
     try:
@@ -377,16 +835,32 @@ def _run_gui(cmd: list[str]) -> int | None:
         _debug(f"gui: {cmd[0]} not found")
         return None
 
-    try:
-        proc.wait(timeout=_GUI_TIMEOUT)
-        _debug(f"gui: {cmd[0]} exited with {proc.returncode}")
-        return proc.returncode
-    except subprocess.TimeoutExpired:
-        _debug(f"gui: {cmd[0]} timed out after {_GUI_TIMEOUT}s, auto-denying")
-        proc.kill()
-        proc.wait()
-        _info(f"Dialog timed out after {_GUI_TIMEOUT}s — auto-denied.")
-        return 1  # treat as denial, not as tool-unavailable
+    deadline = time.monotonic() + timeout
+    while True:
+        wait = deadline - time.monotonic()
+        if cancel is not None:
+            wait = min(wait, _CANCEL_POLL_INTERVAL)
+        if wait > 0:
+            try:
+                proc.wait(timeout=wait)
+                _debug(f"gui: {cmd[0]} exited with {proc.returncode}")
+                return proc.returncode
+            except subprocess.TimeoutExpired:
+                pass
+        if cancel is not None and cancel.is_set():
+            _debug(f"gui: {cmd[0]} dismissed — another channel answered")
+            _kill_gui(proc)
+            return None
+        if time.monotonic() >= deadline:
+            _debug(f"gui: {cmd[0]} timed out after {timeout}s, auto-denying")
+            _kill_gui(proc)
+            _info(f"Dialog timed out after {timeout}s — auto-denied.")
+            return 1  # treat as denial, not as tool-unavailable
+
+
+def _kill_gui(proc: subprocess.Popen) -> None:
+    proc.kill()
+    proc.wait()
 
 
 def _format_approval_msg(cmd_str: str, org: str, repo: str | None = None) -> str:
@@ -399,7 +873,14 @@ def _format_approval_msg(cmd_str: str, org: str, repo: str | None = None) -> str
     )
 
 
-def _ask_xmessage(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
+def _ask_xmessage(
+    cmd_str: str,
+    org: str,
+    repo: str | None = None,
+    *,
+    timeout: int = _GUI_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> bool | None:
     """Lightweight X11 dialog. Returns True=approved, False=denied, None=unavailable."""
     msg = _format_approval_msg(cmd_str, org, repo)
     rc = _run_gui(
@@ -417,14 +898,23 @@ def _ask_xmessage(cmd_str: str, org: str, repo: str | None = None) -> bool | Non
             "-default",
             "Deny",
             msg,
-        ]
+        ],
+        timeout=timeout,
+        cancel=cancel,
     )
     if rc is None:
         return None
     return rc == 0
 
 
-def _ask_zenity(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
+def _ask_zenity(
+    cmd_str: str,
+    org: str,
+    repo: str | None = None,
+    *,
+    timeout: int = _GUI_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     msg = _format_approval_msg(cmd_str, org, repo)
     rc = _run_gui(
@@ -436,14 +926,23 @@ def _ask_zenity(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
             "--width=500",
             "--ok-label=Allow",
             "--cancel-label=Deny",
-        ]
+        ],
+        timeout=timeout,
+        cancel=cancel,
     )
     if rc is None:
         return None  # not installed or timed out
     return rc == 0
 
 
-def _ask_kdialog(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
+def _ask_kdialog(
+    cmd_str: str,
+    org: str,
+    repo: str | None = None,
+    *,
+    timeout: int = _GUI_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     msg = _format_approval_msg(cmd_str, org, repo)
     rc = _run_gui(
@@ -457,14 +956,23 @@ def _ask_kdialog(cmd_str: str, org: str, repo: str | None = None) -> bool | None
             "Allow",
             "--no-label",
             "Deny",
-        ]
+        ],
+        timeout=timeout,
+        cancel=cancel,
     )
     if rc is None:
         return None
     return rc == 0
 
 
-def _ask_osascript(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
+def _ask_osascript(
+    cmd_str: str,
+    org: str,
+    repo: str | None = None,
+    *,
+    timeout: int = _GUI_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     escaped = _escape_for_applescript(
         _format_approval_msg(cmd_str, org, repo).replace("\n", "\\n")
@@ -476,13 +984,20 @@ def _ask_osascript(cmd_str: str, org: str, repo: str | None = None) -> bool | No
         f'default button "Deny" '
         f'with title "GitHub Elevated Access (ghsudo)" with icon caution'
     )
-    rc = _run_gui(["osascript", "-e", script])
+    rc = _run_gui(["osascript", "-e", script], timeout=timeout, cancel=cancel)
     if rc is None:
         return None
     return rc == 0
 
 
-def _ask_powershell(cmd_str: str, org: str, repo: str | None = None) -> bool | None:
+def _ask_powershell(
+    cmd_str: str,
+    org: str,
+    repo: str | None = None,
+    *,
+    timeout: int = _GUI_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     escaped = _escape_for_powershell(cmd_str)
     raw_target = f"Repository: {repo}" if repo else f"Organization: {org}"
@@ -499,7 +1014,7 @@ def _ask_powershell(cmd_str: str, org: str, repo: str | None = None) -> bool | N
         "[System.Windows.Forms.MessageBoxIcon]::Warning); "
         'if ($r -eq "Yes") { exit 0 } else { exit 1 }'
     )
-    rc = _run_gui(["powershell", "-Command", ps])
+    rc = _run_gui(["powershell", "-Command", ps], timeout=timeout, cancel=cancel)
     if rc is None:
         return None
     return rc == 0
@@ -516,33 +1031,80 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _ask_gui(
+    cmd_str: str,
+    org: str,
+    repo: str | None = None,
+    *,
+    timeout: int = _GUI_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> bool | None:
+    """Ask via the platform's dialog. None means no toolkit could show it."""
+    system = platform.system()
+    if system == "Linux":
+        # Try lightest first: xmessage → zenity → kdialog
+        for ask in (_ask_xmessage, _ask_zenity, _ask_kdialog):
+            if cancel is not None and cancel.is_set():
+                return None
+            result = ask(cmd_str, org, repo, timeout=timeout, cancel=cancel)
+            if result is not None:
+                return result
+        return None
+    if system == "Darwin":
+        return _ask_osascript(cmd_str, org, repo, timeout=timeout, cancel=cancel)
+    if system == "Windows":
+        return _ask_powershell(cmd_str, org, repo, timeout=timeout, cancel=cancel)
+    return None
+
+
 def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
     """Ask the user to approve the command. Returns True if approved."""
     system = platform.system()
-    _debug(f"approval: system={system}, has_display={_has_display()}")
+    has_display = _has_display()
+    cfg = _load_ntfy_config()
+    remote = cfg is not None and cfg.mode == _MODE_REMOTE_APPROVE
+    _debug(
+        f"approval: system={system}, has_display={has_display}, "
+        f"ntfy={cfg.mode if cfg else None}"
+    )
 
-    if _has_display():
-        gui_result = None
-        if system == "Linux":
-            # Try lightest first: xmessage → zenity → kdialog
-            gui_result = _ask_xmessage(cmd_str, org, repo)
-            if gui_result is None:
-                gui_result = _ask_zenity(cmd_str, org, repo)
-            if gui_result is None:
-                gui_result = _ask_kdialog(cmd_str, org, repo)
-        elif system == "Darwin":
-            gui_result = _ask_osascript(cmd_str, org, repo)
-        elif system == "Windows":
-            gui_result = _ask_powershell(cmd_str, org, repo)
+    if cfg is not None and not remote:
+        _notify_async(cfg, cmd_str, org, repo)
 
-        # If a GUI tool gave a definitive answer, use it (no terminal re-ask)
-        if gui_result is not None:
-            return gui_result
+    # While the phone can still answer, the dialog must stay up just as long.
+    timeout = max(_GUI_TIMEOUT, cfg.timeout) if remote and cfg else _GUI_TIMEOUT
+    cancel = threading.Event()
+    channels: list[_Channel] = []
+    if has_display:
+        channels.append(
+            (
+                "gui",
+                lambda: _ask_gui(cmd_str, org, repo, timeout=timeout, cancel=cancel),
+                cancel.set,
+            )
+        )
+    if remote and cfg is not None:
+        ntfy = _NtfyChannel(cfg, cmd_str, org, repo)
+        channels.append(("ntfy", ntfy.run, ntfy.cancel))
 
-    # Cannot get user approval — either no display or no GUI toolkit found
-    if not _has_display():
+    if len(channels) == 1:
+        # Nothing to race — keep the single channel on the main thread.
+        answer = channels[0][1]()
+    else:
+        answer = _race_approval(channels, timeout=timeout + _RACE_SLACK)
+    if answer is not None:
+        return answer
+
+    # Cannot get user approval — no channel could reach the user.
+    if not has_display:
         _err("Cannot request approval: no graphical display available.")
         _err("Ensure DISPLAY or WAYLAND_DISPLAY is set (e.g. ssh -X).")
+        if remote:
+            _err("The ntfy approval request could not be delivered either.")
+        else:
+            _err(
+                "Or approve from your phone:  ghsudo --setup-ntfy --mode remote-approve"
+            )
     else:
         _err("Cannot request approval: no supported GUI dialog tool found.")
         if system == "Linux":
@@ -567,7 +1129,7 @@ def _validate_token(token: str) -> dict | None:
         headers={
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "ghsudo/1.0",
+            "User-Agent": _USER_AGENT,
         },
     )
     try:
@@ -588,7 +1150,7 @@ def _get_token_scopes(token: str) -> str | None:
         headers={
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github+json",
-            "User-Agent": "ghsudo/1.0",
+            "User-Agent": _USER_AGENT,
         },
     )
     try:
@@ -620,11 +1182,7 @@ def cmd_setup(org: str) -> int:
 
     if path.exists():
         _info(f"A token for '{org}' is already stored.")
-        try:
-            answer = input(f"{_PREFIX} Overwrite? (yes/no): ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return EXIT_ERROR
-        if answer not in ("yes", "y"):
+        if not _confirm("Overwrite?"):
             _info("Aborted.")
             return EXIT_ERROR
 
@@ -650,6 +1208,139 @@ def cmd_setup(org: str) -> int:
 
     _save_token(org, token)
     _info(f"Token for '{org}' encrypted and saved.")
+    _info(_MACHINE_KEY_NOTE)
+    return EXIT_OK
+
+
+def _confirm(question: str) -> bool:
+    """Ask a yes/no question. Anything but an explicit yes means no."""
+    try:
+        return input(f"{_PREFIX} {question} (yes/no): ").strip().lower() in ("yes", "y")
+    except (EOFError, KeyboardInterrupt, OSError):
+        return False
+
+
+def _prompt(label: str, default: str) -> str | None:
+    """Read one line, returning *default* on empty input or None if aborted.
+
+    Without a terminal there is nobody to ask, so *default* is used as-is —
+    that keeps `--setup-ntfy` fully scriptable from its flags.
+    """
+    if not sys.stdin.isatty():
+        _debug(f"prompt: stdin is not a terminal, using default for {label!r}")
+        return default
+    try:
+        answer = input(f"{_PREFIX} {label} [{default}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return answer or default
+
+
+def _parse_ntfy_flags(args: list[str]) -> dict[str, str] | None:
+    """Parse --mode/--server/--topic for --setup-ntfy. None on a bad option."""
+    known = ("--mode", "--server", "--topic")
+    opts: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        name, sep, inline = args[i].partition("=")
+        if name not in known:
+            _err(f"Unknown option for --setup-ntfy: {args[i]}")
+            _err(f"Expected one of: {', '.join(known)}")
+            return None
+        if sep:
+            value = inline
+        elif i + 1 < len(args):
+            value = args[i + 1]
+            i += 1
+        else:
+            _err(f"{name} requires a value.")
+            return None
+        opts[name[2:]] = value
+        i += 1
+    return opts
+
+
+def cmd_setup_ntfy(
+    *,
+    mode: str | None = None,
+    server: str | None = None,
+    topic: str | None = None,
+) -> int:
+    """Configure push notifications (and optionally approval) over ntfy."""
+    _info("ghsudo — ntfy notification setup")
+    _info("")
+
+    if _NOTIFY_PATH.exists():
+        _info("An ntfy configuration is already stored.")
+        if not _confirm("Overwrite?"):
+            _info("Aborted.")
+            return EXIT_ERROR
+
+    if server is None:
+        server = _prompt("ntfy server", _NTFY_DEFAULT_SERVER)
+    if topic is None:
+        topic = _prompt("Topic", _generate_ntfy_topic())
+    if mode is None:
+        mode = _prompt(f"Mode ({' | '.join(_NTFY_MODES)})", _MODE_NOTIFY)
+    if server is None or topic is None or mode is None:
+        _info("\nAborted.")
+        return EXIT_ERROR
+
+    if mode not in _NTFY_MODES:
+        _err(f"Invalid mode: {mode!r}. Expected one of: {', '.join(_NTFY_MODES)}")
+        return EXIT_ERROR
+    normalized_server = _normalize_server(server)
+    if normalized_server is None:
+        _err(f"Invalid server: {server!r}. Expected an http(s) URL.")
+        return EXIT_ERROR
+    topic = topic.strip()
+    if not _NTFY_TOPIC_RE.match(topic):
+        _err(f"Invalid topic: {topic!r}.")
+        _err("Use 1-64 letters, digits, hyphens or underscores.")
+        return EXIT_ERROR
+
+    auth_token = None
+    if sys.stdin.isatty():
+        try:
+            auth_token = getpass.getpass(
+                f"{_PREFIX} Access token for self-hosted servers (blank for none): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            _info("\nAborted.")
+            return EXIT_ERROR
+
+    cfg = _NtfyConfig(
+        topic=topic,
+        server=normalized_server,
+        mode=mode,
+        auth_token=auth_token or None,
+        timeout=_NTFY_DEFAULT_TIMEOUT,
+    )
+
+    _info("")
+    _info(f"Sending a test notification to {cfg.server}/{cfg.topic} ...")
+    if not _ntfy_publish(
+        cfg,
+        topic=cfg.topic,
+        title="ghsudo: setup test",
+        message="If you can read this, ghsudo can reach your devices.",
+        tags="white_check_mark",
+    ):
+        _err("Test notification failed — nothing was saved.")
+        _err("Check the server URL, topic and access token, then retry.")
+        return EXIT_ERROR
+
+    _save_ntfy_config(cfg)
+    _info(f"Saved (mode: {cfg.mode}) to {_NOTIFY_PATH}")
+    _info("")
+    _info(f"Subscribe on your phone: install the ntfy app, add {cfg.server},")
+    _info(f"and subscribe to the topic '{cfg.topic}'.")
+    if cfg.mode == _MODE_REMOTE_APPROVE:
+        _info("")
+        _info(f"Approval requests wait up to {cfg.timeout}s for an Allow/Deny tap.")
+        _info("Anyone who can publish to your topic can answer for you — prefer a")
+        _info("self-hosted ntfy server with topic ACLs over the public instance.")
+    _info(_MACHINE_KEY_NOTE)
     return EXIT_OK
 
 
@@ -712,8 +1403,17 @@ def cmd_run(cmd: list[str], *, org: str | None = None) -> int:
 
 
 def cmd_verify(org: str | None = None) -> int:
-    """Verify stored token(s) can be decrypted and are valid."""
+    """Verify stored token(s) and, when configured, the ntfy connection."""
+    result = _verify_tokens(org)
 
+    cfg = _load_ntfy_config()
+    if cfg is not None and _verify_ntfy(cfg) != EXIT_OK and result == EXIT_OK:
+        result = EXIT_ERROR
+    return result
+
+
+def _verify_tokens(org: str | None) -> int:
+    """Verify stored token(s) can be decrypted and are valid."""
     if org:
         return _verify_one(_validate_org_name(org))
 
@@ -735,6 +1435,24 @@ def cmd_verify(org: str | None = None) -> int:
         return EXIT_ERROR
 
     _info(f"\nAll {len(orgs)} token(s) verified OK.")
+    return EXIT_OK
+
+
+def _verify_ntfy(cfg: _NtfyConfig) -> int:
+    """Publish a test notification to confirm the ntfy channel works."""
+    _info(f"--- ntfy ({cfg.mode}) ---")
+    _info(f"Publishing a test notification to {cfg.server}/{cfg.topic} ...")
+    if not _ntfy_publish(
+        cfg,
+        topic=cfg.topic,
+        title="ghsudo: verification",
+        message="ntfy channel verified.",
+        tags="white_check_mark",
+    ):
+        _err("ntfy test notification failed.")
+        _err("Re-run:  ghsudo --setup-ntfy")
+        return EXIT_ERROR
+    _info("ntfy OK.")
     return EXIT_OK
 
 
@@ -807,16 +1525,19 @@ def _revoke_one(org: str) -> int:
 
 
 def cmd_list() -> int:
-    """List organizations with stored tokens."""
+    """List organizations with stored tokens, and the ntfy channel if set up."""
     orgs = _list_orgs()
-    if not orgs:
+    if orgs:
+        _info(f"Stored tokens ({len(orgs)}):")
+        for org in orgs:
+            _info(f"  {org}")
+    else:
         _info("No tokens stored.")
         _info("Run:  ghsudo --setup <org>")
-        return EXIT_OK
 
-    _info(f"Stored tokens ({len(orgs)}):")
-    for org in orgs:
-        _info(f"  {org}")
+    cfg = _load_ntfy_config()
+    if cfg is not None:
+        _info(f"ntfy: configured ({cfg.mode}, topic '{cfg.topic}' on {cfg.server})")
     return EXIT_OK
 
 
@@ -827,6 +1548,7 @@ def cmd_list() -> int:
 _USAGE = """\
 usage: ghsudo [options] <command...>
        ghsudo --setup <org>
+       ghsudo --setup-ntfy [--mode MODE] [--server URL] [--topic NAME]
        ghsudo --list | --verify [org] | --revoke [org]
 
 GitHub Sudo — re-execute commands with per-org elevated tokens.
@@ -838,7 +1560,12 @@ Anything not prefixed with -- is the command to run:
 Options:
   --org ORG       Target org (auto-detected from -R flag or git remote)
   --setup ORG     Store encrypted GitHub PAT for an org
-  --verify [ORG]  Verify stored token(s)
+  --setup-ntfy    Configure ntfy push notifications
+      --mode MODE     notify (heads-up only, default) or remote-approve
+                      (approve by tapping Allow/Deny on the push)
+      --server URL    ntfy server (default: https://ntfy.sh)
+      --topic NAME    Topic to publish to (default: randomly generated)
+  --verify [ORG]  Verify stored token(s) and the ntfy connection
   --revoke [ORG]  Revoke stored token(s)
   --list          List orgs with stored tokens
   -h, --help      Show this help
@@ -863,6 +1590,11 @@ def main() -> int:
                 _err("--setup requires an org name.")
                 return EXIT_ERROR
             return cmd_setup(argv[i + 1])
+        elif arg == "--setup-ntfy":
+            opts = _parse_ntfy_flags(argv[i + 1 :])
+            if opts is None:
+                return EXIT_ERROR
+            return cmd_setup_ntfy(**opts)
         elif arg == "--list":
             return cmd_list()
         elif arg == "--verify":
