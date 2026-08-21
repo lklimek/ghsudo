@@ -287,6 +287,35 @@ class TestNtfyPublish:
             {"topic": "ghsudo-test", "title": "T", "message": "M"}
         ]
 
+    def test_tags_sent_as_json_array_not_bare_string(self):
+        # ntfy's JSON API rejects a bare string for "tags" with HTTP 400 —
+        # it must be an array, even for a single tag.
+        fake = _FakeUrlopen()
+        with _patch_urlopen(fake):
+            main._ntfy_publish(
+                _cfg(),
+                topic="ghsudo-test",
+                title="T",
+                message="M",
+                tags="closed_lock_with_key",
+            )
+        assert fake.published[0]["tags"] == ["closed_lock_with_key"]
+        assert isinstance(fake.published[0]["tags"], list)
+
+    def test_comma_separated_tags_become_multiple_array_entries(self):
+        fake = _FakeUrlopen()
+        with _patch_urlopen(fake):
+            main._ntfy_publish(
+                _cfg(), topic="ghsudo-test", title="T", message="M", tags="a, b ,c"
+            )
+        assert fake.published[0]["tags"] == ["a", "b", "c"]
+
+    def test_no_tags_key_when_tags_omitted(self):
+        fake = _FakeUrlopen()
+        with _patch_urlopen(fake):
+            main._ntfy_publish(_cfg(), topic="ghsudo-test", title="T", message="M")
+        assert "tags" not in fake.published[0]
+
     def test_multiline_message_survives(self):
         fake = _FakeUrlopen()
         with _patch_urlopen(fake):
