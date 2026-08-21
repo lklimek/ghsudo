@@ -540,7 +540,10 @@ def _ntfy_publish(
     """Publish one notification. Returns False on any delivery failure.
 
     Uses ntfy's JSON API rather than headers so that command text with newlines
-    or non-ASCII characters survives intact.
+    or non-ASCII characters survives intact. ``tags`` is a comma-separated
+    string of one or more ntfy emoji-short-code tags (e.g. "closed_lock_with_key"
+    or "tag_one,tag_two") — ntfy's JSON API requires the wire value to be an
+    array, not a bare string, so it is split and wrapped here.
     """
     import json  # noqa: PLC0415
     from urllib.request import Request, urlopen  # noqa: PLC0415
@@ -549,7 +552,7 @@ def _ntfy_publish(
     if actions:
         payload["actions"] = actions
     if tags:
-        payload["tags"] = tags
+        payload["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
     if priority is not None:
         payload["priority"] = priority
 
