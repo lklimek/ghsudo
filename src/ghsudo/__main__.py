@@ -29,6 +29,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from ghsudo import __version__
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -45,7 +47,7 @@ _TOKENS_DIR = _CONFIG_DIR / "tokens"
 _NOTIFY_PATH = _CONFIG_DIR / "notify.enc"
 
 _README_URL = "https://github.com/lklimek/ghsudo#readme"
-_USER_AGENT = "ghsudo/1.0"
+_USER_AGENT = f"ghsudo/{__version__}"
 
 _MACHINE_KEY_NOTE = (
     "Note: the encryption key is derived from this machine's identifiers, so "
@@ -543,7 +545,7 @@ def _ntfy_publish(
         payload["actions"] = actions
     if tags:
         payload["tags"] = tags
-    if priority:
+    if priority is not None:
         payload["priority"] = priority
 
     try:
@@ -859,8 +861,13 @@ def _run_gui(
 
 
 def _kill_gui(proc: subprocess.Popen) -> None:
-    proc.kill()
-    proc.wait()
+    try:
+        proc.kill()
+        proc.wait()
+    except OSError:
+        # Process already exited on its own (e.g. the dialog was answered right
+        # as we decided to cancel/timeout it) — nothing left to clean up.
+        pass
 
 
 def _format_approval_msg(cmd_str: str, org: str, repo: str | None = None) -> str:

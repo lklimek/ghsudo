@@ -228,7 +228,7 @@ A graphical display is **required** unless you configure [remote approval over n
 
 > **Tip:** If you run your agent on a remote machine via SSH, use `ssh -X` (X11 forwarding) so that `ghsudo` GUI dialogs appear on your local display — or set up `--setup-ntfy --mode remote-approve` and approve from your phone.
 
-The dialog auto-denies after **60 seconds** of no response to prevent the agent from hanging indefinitely.
+The dialog auto-denies after **60 seconds** of no response to prevent the agent from hanging indefinitely — except in `remote-approve` mode, where the GUI timeout is extended to match the ntfy timeout (default 300s), so the desktop dialog doesn't deny while your phone can still answer.
 
 ## Token management
 
