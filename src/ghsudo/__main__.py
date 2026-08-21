@@ -538,6 +538,7 @@ def _ntfy_publish(
     tags: str | None = None,
     priority: int | None = None,
     timeout: float = _NTFY_PUBLISH_TIMEOUT,
+    id_out: list[str] | None = None,
 ) -> bool:
     """Publish one notification. Returns False on any delivery failure.
 
@@ -546,6 +547,11 @@ def _ntfy_publish(
     string of one or more ntfy emoji-short-code tags (e.g. "closed_lock_with_key"
     or "tag_one,tag_two") — ntfy's JSON API requires the wire value to be an
     array, not a bare string, so it is split and wrapped here.
+
+    If *id_out* is given and the publish succeeds, the server-assigned
+    message id is appended to it (best-effort — left empty if the response
+    body doesn't parse or carry one). Only reads the response body when
+    *id_out* is passed, to avoid the extra work for callers that don't need it.
     """
     import json  # noqa: PLC0415
     from urllib.request import Request, urlopen  # noqa: PLC0415
@@ -567,13 +573,55 @@ def _ntfy_publish(
         )
         with urlopen(req, timeout=timeout) as resp:  # noqa: S310
             status = getattr(resp, "status", 200)
+            body = resp.read() if id_out is not None else b""
     except (OSError, ValueError) as exc:  # URLError/HTTPError are OSError subclasses
         _debug(f"ntfy: publish to '{topic}' failed: {exc}")
         return False
     if not 200 <= status < 300:
         _debug(f"ntfy: publish to '{topic}' returned HTTP {status}")
         return False
+    if id_out is not None:
+        try:
+            msg_id = json.loads(body).get("id")
+        except (json.JSONDecodeError, AttributeError):
+            msg_id = None
+        if msg_id:
+            id_out.append(msg_id)
     _debug(f"ntfy: published to '{topic}'")
+    return True
+
+
+def _ntfy_delete(
+    cfg: _NtfyConfig,
+    topic: str,
+    message_id: str,
+    *,
+    timeout: float = _NTFY_PUBLISH_TIMEOUT,
+) -> bool:
+    """Delete a previously published message from ntfy.
+
+    Removes it from both the OS notification drawer and the app's own
+    history — verified live against ntfy.sh; the documented ``/clear``
+    endpoint only clears the drawer and leaves it in the app's history.
+    """
+    from urllib.parse import quote  # noqa: PLC0415
+    from urllib.request import Request, urlopen  # noqa: PLC0415
+
+    try:
+        req = Request(  # noqa: S310 — scheme validated by _normalize_server
+            f"{cfg.server}/{quote(topic, safe='')}/{quote(message_id, safe='')}",
+            method="DELETE",
+            headers=_ntfy_headers(cfg),
+        )
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            status = getattr(resp, "status", 200)
+    except (OSError, ValueError) as exc:
+        _debug(f"ntfy: delete of message '{message_id}' failed: {exc}")
+        return False
+    if not 200 <= status < 300:
+        _debug(f"ntfy: delete of message '{message_id}' returned HTTP {status}")
+        return False
+    _debug(f"ntfy: deleted message '{message_id}'")
     return True
 
 
@@ -667,6 +715,7 @@ class _NtfyChannel:
         self._stream = None
         self._cancelled = False
         self._published = False
+        self._message_id: str | None = None
 
     def cancel(self) -> None:
         """Abandon the wait.
@@ -691,12 +740,13 @@ class _NtfyChannel:
             self._cancelled = True
             stream = self._stream
             published = self._published
+            message_id = self._message_id
         if stream is not None:
             threading.Thread(
                 target=self._close_stream, args=(stream,), daemon=True
             ).start()
         if published:
-            self._notify_already_handled()
+            self._discard_original_request(message_id)
 
     @staticmethod
     def _close_stream(stream) -> None:
@@ -706,10 +756,30 @@ class _NtfyChannel:
         except OSError:
             pass
 
+    def _discard_original_request(self, message_id: str | None) -> None:
+        """Get rid of the now-moot Allow/Deny notification on the phone.
+
+        Prefers deleting the original message outright — verified live to
+        remove it from both the OS notification drawer and the app's own
+        history, unlike ntfy's ``/clear`` endpoint (drawer only). Falls back
+        to a "no longer active" follow-up notice only when there's no
+        message id to delete (e.g. a non-standard server that doesn't
+        return one) or the delete itself fails.
+        """
+        if message_id and _ntfy_delete(
+            self._cfg,
+            self._cfg.topic,
+            message_id,
+            timeout=_NTFY_CANCEL_NOTICE_TIMEOUT,
+        ):
+            return
+        self._notify_already_handled()
+
     def _notify_already_handled(self) -> None:
-        """Best-effort: ntfy has no API to retract a delivered push, so the
-        original Allow/Deny notification stays visible on the phone even
-        after another channel decided. Send a follow-up so the phone
+        """Fallback for when the original message can't be deleted: ntfy
+        has no other API to retract a delivered push, so without this the
+        original Allow/Deny notification would stay visible on the phone
+        even after another channel decided. Send a follow-up so the phone
         reflects that it's no longer actionable, instead of looking like
         ghsudo is still waiting on it.
 
@@ -783,6 +853,7 @@ class _NtfyChannel:
                 _debug("ntfy: cancelled before the approval request was sent")
                 return None
 
+        id_out: list[str] = []
         if not _ntfy_publish(
             self._cfg,
             topic=self._cfg.topic,
@@ -791,11 +862,24 @@ class _NtfyChannel:
             actions=_ntfy_reply_actions(self._cfg, reply_topic),
             tags="closed_lock_with_key",
             priority=5,
+            id_out=id_out,
         ):
             _err("ntfy: could not send the approval request.")
             return None
         with self._lock:
             self._published = True
+            self._message_id = id_out[0] if id_out else None
+            # cancel() may have run while the publish POST was still
+            # in-flight: at that point _published was still False, so
+            # cancel() had nothing to discard yet. Catch that here, still
+            # under the same lock cancel() uses, so exactly one of the two
+            # ends up performing the cleanup.
+            already_cancelled = self._cancelled
+
+        if already_cancelled:
+            _debug("ntfy: cancelled while the approval request was in flight")
+            self._discard_original_request(self._message_id)
+            return None
 
         _info(
             f"ntfy: approval request sent to '{self._cfg.topic}' "

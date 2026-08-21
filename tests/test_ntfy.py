@@ -68,13 +68,14 @@ class _FakeStream:
 
 
 class _FakeResponse:
-    """Stand-in for a publish response."""
+    """Stand-in for a publish/delete response."""
 
-    def __init__(self, status: int = 200):
+    def __init__(self, status: int = 200, msg_id: str | None = None):
         self.status = status
+        self._msg_id = msg_id
 
     def read(self):
-        return b"{}"
+        return json.dumps({"id": self._msg_id} if self._msg_id else {}).encode()
 
     def __enter__(self):
         return self
@@ -84,17 +85,37 @@ class _FakeResponse:
 
 
 class _FakeUrlopen:
-    """Routes publish (POST) and subscribe (GET .../json) calls to canned results."""
+    """Routes publish (POST), subscribe (GET .../json), and delete (DELETE)
+    calls to canned results. Publish responses carry a real-shaped
+    server-assigned id (real ntfy always includes one), matching production.
+    """
 
-    def __init__(self, *, stream=None, publish_status: int = 200, publish_error=None):
+    def __init__(
+        self,
+        *,
+        stream=None,
+        publish_status: int = 200,
+        publish_error=None,
+        delete_status: int = 200,
+        delete_error=None,
+    ):
         self.stream = stream
         self.publish_status = publish_status
         self.publish_error = publish_error
+        self.delete_status = delete_status
+        self.delete_error = delete_error
         self.published: list[dict] = []
         self.subscribed: list[str] = []
+        self.deleted: list[str] = []
+        self._next_id = 1
 
     def __call__(self, req, timeout=None):
         url = req.full_url
+        if req.get_method() == "DELETE":
+            self.deleted.append(url.rsplit("/", 1)[-1])
+            if self.delete_error is not None:
+                raise self.delete_error
+            return _FakeResponse(self.delete_status)
         if url.endswith("/json"):
             self.subscribed.append(url)
             if self.stream is None:
@@ -103,7 +124,9 @@ class _FakeUrlopen:
         if self.publish_error is not None:
             raise self.publish_error
         self.published.append(json.loads(req.data.decode()))
-        return _FakeResponse(self.publish_status)
+        msg_id = f"fake-id-{self._next_id}"
+        self._next_id += 1
+        return _FakeResponse(self.publish_status, msg_id=msg_id)
 
 
 def _patch_urlopen(fake):
@@ -518,29 +541,76 @@ class TestNtfyChannel:
             chan.run()
         assert order == ["subscribe", "publish"]
 
-    def test_cancel_sends_an_already_handled_follow_up_synchronously(self):
-        # ntfy has no API to retract a delivered push — the original
-        # Allow/Deny notification stays on the phone regardless. cancel()
-        # sends a follow-up so it doesn't look like ghsudo is still waiting
-        # on a request that was actually decided elsewhere. This runs
-        # synchronously (no background thread) so it's guaranteed to have
-        # happened by the time cancel() returns — no polling/sleeping needed
-        # in this test, and none needed in production either.
+    def test_cancel_deletes_the_original_message(self):
+        # Preferred path: DELETE removes the original Allow/Deny
+        # notification from both the OS drawer and the app's own history
+        # (verified live against ntfy.sh) — far cleaner than leaving it and
+        # sending a second "no longer active" notification alongside it.
         fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]))
         chan = main._NtfyChannel(
             _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
         )
         with _patch_urlopen(fake):
-            chan.run()  # publishes the original request, then we cancel it
+            chan.run()  # publishes the original request, capturing its id
             chan.cancel()
-        assert len(fake.published) == 2
-        assert fake.published[0]["title"] == "ghsudo: approve elevated GitHub access?"
+        assert len(fake.published) == 1  # no follow-up notification needed
+        assert fake.deleted == ["fake-id-1"]
+
+    def test_cancel_falls_back_to_follow_up_when_delete_fails(self):
+        fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]), delete_status=404)
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            chan.run()
+            chan.cancel()
+        assert fake.deleted == ["fake-id-1"]  # delete was attempted
+        assert len(fake.published) == 2  # ...and the fallback notice went out
         assert "no longer active" in fake.published[1]["title"]
 
-    def test_cancel_before_publish_sends_no_follow_up(self):
-        # Nothing was ever sent to the phone, so there's nothing to
-        # retroactively mark "no longer active" — sending one anyway would
-        # just be a confusing, unprompted notification.
+    def test_cancel_falls_back_to_follow_up_when_no_message_id(self):
+        # A non-standard server whose publish response doesn't carry an id.
+        fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            chan.run()
+        chan._message_id = None  # simulate: publish succeeded, no id returned
+        with _patch_urlopen(fake):
+            chan.cancel()
+        assert fake.deleted == []  # nothing to delete
+        assert len(fake.published) == 2
+        assert "no longer active" in fake.published[1]["title"]
+
+    def test_cancel_during_publish_still_discards_the_message(self, monkeypatch):
+        # cancel() landing while _ntfy_publish() is still in-flight used to
+        # be lost: _published was still False when cancel() read it, so
+        # cancel() had nothing to discard, and _await_reply() then set
+        # _published=True without ever re-checking _cancelled — leaving the
+        # original Allow/Deny notification stranded on the phone.
+        fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        real_publish = main._ntfy_publish
+
+        def publish_then_cancel(*args, **kwargs):
+            result = real_publish(*args, **kwargs)
+            chan.cancel()  # arrives mid-publish, before _published flips True
+            return result
+
+        monkeypatch.setattr(main, "_ntfy_publish", publish_then_cancel)
+        with _patch_urlopen(fake):
+            result = chan.run()
+
+        assert result is None
+        assert fake.deleted == ["fake-id-1"]  # cleaned up, not stranded
+        assert len(fake.published) == 1  # no redundant fallback notice
+
+    def test_cancel_before_publish_does_nothing(self):
+        # Nothing was ever sent to the phone, so there's nothing to delete
+        # or retroactively mark "no longer active".
         fake = _FakeUrlopen(stream=_FakeStream([]))
         chan = main._NtfyChannel(
             _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
@@ -548,6 +618,7 @@ class TestNtfyChannel:
         with _patch_urlopen(fake):
             chan.cancel()  # never called run()/_await_reply() — nothing published
         assert fake.published == []
+        assert fake.deleted == []
 
     def test_cancelled_before_await_reply_skips_publishing_the_stale_request(self):
         # A fast GUI win can cancel the ntfy channel after the reply stream
@@ -563,9 +634,9 @@ class TestNtfyChannel:
         assert result is None
         assert fake.published == []
 
-    def test_cancel_follow_up_failure_does_not_raise(self):
+    def test_cancel_cleanup_failure_does_not_raise(self):
         # Best-effort: a broken network must not surface as an exception
-        # from cancel() itself.
+        # from cancel() itself, whether the delete or the fallback fails.
         fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]))
         chan = main._NtfyChannel(
             _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
