@@ -869,6 +869,17 @@ class _NtfyChannel:
         with self._lock:
             self._published = True
             self._message_id = id_out[0] if id_out else None
+            # cancel() may have run while the publish POST was still
+            # in-flight: at that point _published was still False, so
+            # cancel() had nothing to discard yet. Catch that here, still
+            # under the same lock cancel() uses, so exactly one of the two
+            # ends up performing the cleanup.
+            already_cancelled = self._cancelled
+
+        if already_cancelled:
+            _debug("ntfy: cancelled while the approval request was in flight")
+            self._discard_original_request(self._message_id)
+            return None
 
         _info(
             f"ntfy: approval request sent to '{self._cfg.topic}' "

@@ -583,6 +583,31 @@ class TestNtfyChannel:
         assert len(fake.published) == 2
         assert "no longer active" in fake.published[1]["title"]
 
+    def test_cancel_during_publish_still_discards_the_message(self, monkeypatch):
+        # cancel() landing while _ntfy_publish() is still in-flight used to
+        # be lost: _published was still False when cancel() read it, so
+        # cancel() had nothing to discard, and _await_reply() then set
+        # _published=True without ever re-checking _cancelled — leaving the
+        # original Allow/Deny notification stranded on the phone.
+        fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        real_publish = main._ntfy_publish
+
+        def publish_then_cancel(*args, **kwargs):
+            result = real_publish(*args, **kwargs)
+            chan.cancel()  # arrives mid-publish, before _published flips True
+            return result
+
+        monkeypatch.setattr(main, "_ntfy_publish", publish_then_cancel)
+        with _patch_urlopen(fake):
+            result = chan.run()
+
+        assert result is None
+        assert fake.deleted == ["fake-id-1"]  # cleaned up, not stranded
+        assert len(fake.published) == 1  # no redundant fallback notice
+
     def test_cancel_before_publish_does_nothing(self):
         # Nothing was ever sent to the phone, so there's nothing to delete
         # or retroactively mark "no longer active".
