@@ -63,6 +63,7 @@ _NTFY_DEFAULT_SERVER = "https://ntfy.sh"
 _NTFY_DEFAULT_TIMEOUT = 300  # seconds — a phone reply is slower than a click
 _NTFY_MAX_TIMEOUT = 3600
 _NTFY_PUBLISH_TIMEOUT = 10
+_NTFY_CANCEL_NOTICE_TIMEOUT = 2  # bounded, synchronous — see _notify_already_handled
 _NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _REPLY_ALLOW = "allow"
 _REPLY_DENY = "deny"
@@ -536,6 +537,7 @@ def _ntfy_publish(
     actions: list[dict] | None = None,
     tags: str | None = None,
     priority: int | None = None,
+    timeout: float = _NTFY_PUBLISH_TIMEOUT,
 ) -> bool:
     """Publish one notification. Returns False on any delivery failure.
 
@@ -563,7 +565,7 @@ def _ntfy_publish(
             method="POST",
             headers={"Content-Type": "application/json", **_ntfy_headers(cfg)},
         )
-        with urlopen(req, timeout=_NTFY_PUBLISH_TIMEOUT) as resp:  # noqa: S310
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
             status = getattr(resp, "status", 200)
     except (OSError, ValueError) as exc:  # URLError/HTTPError are OSError subclasses
         _debug(f"ntfy: publish to '{topic}' failed: {exc}")
@@ -664,44 +666,75 @@ class _NtfyChannel:
         self._lock = threading.Lock()
         self._stream = None
         self._cancelled = False
+        self._published = False
 
     def cancel(self) -> None:
-        """Abandon the wait, unblocking a reader parked on the reply stream."""
+        """Abandon the wait.
+
+        Does NOT synchronously close the reply stream. Closing a socket
+        response object from a different thread while a reader thread is
+        blocked inside it does not reliably interrupt that blocked read —
+        it's a well-known cross-thread hazard, and closing here empirically
+        blocks for as long as the reader's own remaining timeout (measured:
+        ~5s wait on a 5s-timeout channel, i.e. close() effectively just
+        waited for the reader to finish on its own). Calling it synchronously
+        from ``_race_approval``'s cancel loop would make *ghsudo itself*
+        block for up to the full ntfy timeout after the GUI already
+        answered — precisely the "ghsudo still waits for ntfy" symptom this
+        cancellation exists to prevent. The reader thread is a daemon
+        thread: if it stays blocked, the OS reclaims it on process exit,
+        same as any other abandoned socket — no user-visible cost. A
+        best-effort close is still attempted, just off the calling thread
+        so it can never block cancel()'s own return.
+        """
         with self._lock:
             self._cancelled = True
             stream = self._stream
+            published = self._published
         if stream is not None:
-            _debug("ntfy: cancelling reply stream")
-            try:
-                stream.close()
-            except OSError:
-                pass
-        self._notify_already_handled()
+            threading.Thread(
+                target=self._close_stream, args=(stream,), daemon=True
+            ).start()
+        if published:
+            self._notify_already_handled()
+
+    @staticmethod
+    def _close_stream(stream) -> None:
+        _debug("ntfy: cancelling reply stream")
+        try:
+            stream.close()
+        except OSError:
+            pass
 
     def _notify_already_handled(self) -> None:
-        """Best-effort, fire-and-forget: ntfy has no API to retract a
-        delivered push, so the original Allow/Deny notification stays
-        visible on the phone even after another channel decided. Send a
-        follow-up so the phone reflects that it's no longer actionable,
-        instead of looking like ghsudo is still waiting on it.
+        """Best-effort: ntfy has no API to retract a delivered push, so the
+        original Allow/Deny notification stays visible on the phone even
+        after another channel decided. Send a follow-up so the phone
+        reflects that it's no longer actionable, instead of looking like
+        ghsudo is still waiting on it.
+
+        Runs synchronously with a short, dedicated timeout — NOT fired off
+        on a background daemon thread. A daemon thread has no guarantee of
+        getting scheduled before ghsudo's own process exits right after
+        cancel() returns (the same race that orphaned the GUI dialog
+        subprocess before this same PR fixed that side); a bounded
+        synchronous call trades a small, capped delay for actually
+        delivering the notice.
         """
-
-        def _send() -> None:
-            try:
-                _ntfy_publish(
-                    self._cfg,
-                    topic=self._cfg.topic,
-                    title="ghsudo: request no longer active",
-                    message=(
-                        "This approval request was already resolved elsewhere "
-                        "(or expired) — no action needed."
-                    ),
-                    tags="information_source",
-                )
-            except Exception as exc:  # noqa: BLE001 — best-effort only
-                _debug(f"ntfy: already-handled notice failed: {exc}")
-
-        threading.Thread(target=_send, daemon=True).start()
+        try:
+            _ntfy_publish(
+                self._cfg,
+                topic=self._cfg.topic,
+                title="ghsudo: request no longer active",
+                message=(
+                    "This approval request was already resolved elsewhere "
+                    "(or expired) — no action needed."
+                ),
+                tags="information_source",
+                timeout=_NTFY_CANCEL_NOTICE_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort only
+            _debug(f"ntfy: already-handled notice failed: {exc}")
 
     def run(self) -> bool | None:
         import secrets  # noqa: PLC0415
@@ -742,6 +775,14 @@ class _NtfyChannel:
                 pass
 
     def _await_reply(self, stream, reply_topic: str, deadline: float) -> bool | None:
+        with self._lock:
+            if self._cancelled:
+                # Lost the race before we ever got to publish — nothing was
+                # sent, so cancel() has nothing to send an "already handled"
+                # follow-up for either.
+                _debug("ntfy: cancelled before the approval request was sent")
+                return None
+
         if not _ntfy_publish(
             self._cfg,
             topic=self._cfg.topic,
@@ -753,6 +794,8 @@ class _NtfyChannel:
         ):
             _err("ntfy: could not send the approval request.")
             return None
+        with self._lock:
+            self._published = True
 
         _info(
             f"ntfy: approval request sent to '{self._cfg.topic}' "
