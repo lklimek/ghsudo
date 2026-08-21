@@ -518,6 +518,63 @@ class TestNtfyChannel:
             chan.run()
         assert order == ["subscribe", "publish"]
 
+    def test_cancel_sends_an_already_handled_follow_up_synchronously(self):
+        # ntfy has no API to retract a delivered push — the original
+        # Allow/Deny notification stays on the phone regardless. cancel()
+        # sends a follow-up so it doesn't look like ghsudo is still waiting
+        # on a request that was actually decided elsewhere. This runs
+        # synchronously (no background thread) so it's guaranteed to have
+        # happened by the time cancel() returns — no polling/sleeping needed
+        # in this test, and none needed in production either.
+        fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            chan.run()  # publishes the original request, then we cancel it
+            chan.cancel()
+        assert len(fake.published) == 2
+        assert fake.published[0]["title"] == "ghsudo: approve elevated GitHub access?"
+        assert "no longer active" in fake.published[1]["title"]
+
+    def test_cancel_before_publish_sends_no_follow_up(self):
+        # Nothing was ever sent to the phone, so there's nothing to
+        # retroactively mark "no longer active" — sending one anyway would
+        # just be a confusing, unprompted notification.
+        fake = _FakeUrlopen(stream=_FakeStream([]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            chan.cancel()  # never called run()/_await_reply() — nothing published
+        assert fake.published == []
+
+    def test_cancelled_before_await_reply_skips_publishing_the_stale_request(self):
+        # A fast GUI win can cancel the ntfy channel after the reply stream
+        # is subscribed but before the original approval request is
+        # published — that request must not go out at all once cancelled.
+        fake = _FakeUrlopen(stream=_FakeStream([]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        chan._cancelled = True  # simulate cancel() landing before _await_reply
+        with _patch_urlopen(fake):
+            result = chan._await_reply(fake.stream, "reply-topic", time.monotonic() + 5)
+        assert result is None
+        assert fake.published == []
+
+    def test_cancel_follow_up_failure_does_not_raise(self):
+        # Best-effort: a broken network must not surface as an exception
+        # from cancel() itself.
+        fake = _FakeUrlopen(stream=_FakeStream([_line("keepalive")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            chan.run()
+        with _patch_urlopen(lambda *a, **k: (_ for _ in ()).throw(OSError("down"))):
+            chan.cancel()  # must not raise
+
     def test_reply_topic_is_fresh_and_never_the_configured_topic(self):
         seen = set()
         for _ in range(3):
@@ -561,6 +618,47 @@ class TestNtfyChannel:
             worker.join(5)
         assert result == [None]
         assert fake.stream.closed
+
+    def test_cancel_returns_promptly_even_if_closing_the_stream_blocks(self):
+        # Regression: a real socket's close() from another thread does not
+        # reliably interrupt a peer thread blocked reading it — empirically,
+        # calling it synchronously here blocked for as long as the reader's
+        # own remaining timeout (~5s on a 5s-timeout channel). cancel() must
+        # never inherit that delay: _race_approval calls it synchronously,
+        # so ghsudo itself would appear to hang after the OTHER channel
+        # already answered.
+        subscribed = threading.Event()
+        release_close = threading.Event()
+
+        class _SlowCloseStream(_FakeStream):
+            def __iter__(self):
+                subscribed.set()
+                while not self.closed:
+                    time.sleep(0.01)
+                raise ValueError("I/O operation on closed file")
+                yield  # pragma: no cover — keeps this a generator
+
+            def close(self):
+                release_close.wait(5)  # simulate a close() that blocks
+                super().close()
+
+        fake = _FakeUrlopen(stream=_SlowCloseStream([]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=30), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            worker = threading.Thread(target=chan.run)
+            worker.start()
+            assert subscribed.wait(5)
+
+            begin = time.monotonic()
+            chan.cancel()
+            elapsed = time.monotonic() - begin
+
+            release_close.set()  # let the simulated slow close() finish
+            worker.join(5)
+
+        assert elapsed < 1, f"cancel() blocked for {elapsed}s on a slow stream.close()"
 
 
 class TestParseNtfyReply:
@@ -675,11 +773,48 @@ class TestRunGui:
         assert time.monotonic() - begin < 10
 
     def test_cancel_dismisses_the_dialog(self):
-        cancel = threading.Event()
+        cancel = main._GuiCancel()
         threading.Timer(0.3, cancel.set).start()
         begin = time.monotonic()
         assert main._run_gui(["/bin/sleep", "30"], timeout=60, cancel=cancel) is None
         assert time.monotonic() - begin < 10
+
+    def test_cancel_kills_the_subprocess_immediately(self):
+        # Regression: cancel.set() must kill the dialog subprocess itself,
+        # synchronously, on the calling thread — not just flip a flag for
+        # _run_gui's own (daemon) polling thread to notice on its own time.
+        # A daemon thread killed by process exit before its next poll would
+        # never run the kill at all, orphaning the dialog window.
+        cancel = main._GuiCancel()
+
+        thread = threading.Thread(
+            target=main._run_gui,
+            args=(["/bin/sleep", "30"],),
+            kwargs={"timeout": 60, "cancel": cancel},
+        )
+        thread.start()
+
+        # Wait until the subprocess is actually registered so we cancel a
+        # live process, not a not-yet-launched one.
+        proc = None
+        for _ in range(100):
+            with cancel._lock:
+                proc = cancel._proc
+            if proc is not None:
+                break
+            time.sleep(0.02)
+        assert proc is not None, "dialog subprocess never registered"
+
+        begin = time.monotonic()
+        cancel.set()
+        elapsed = time.monotonic() - begin
+        # set() itself must have killed it — no poll interval to wait out.
+        # A generous margin under _CANCEL_POLL_INTERVAL (0.2s) so this still
+        # fails if a regression falls back to polling for the kill instead
+        # of doing it synchronously inside set().
+        assert elapsed < 0.1
+        assert proc.poll() is not None
+        thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
