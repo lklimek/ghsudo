@@ -264,7 +264,7 @@ Setup sends a test notification and stores the settings encrypted at `~/.config/
 
 **How remote-approve works:** each request publishes a notification whose Allow/Deny buttons post to a **freshly generated, single-use reply topic** that is never written to disk. `ghsudo` waits up to **300 seconds** for the reply; no reply means denial. If a display is also available, the desktop dialog and the push race each other — the first decisive answer wins and the other is dismissed.
 
-**Environment overrides** — `GHSUDO_NTFY_SERVER`, `GHSUDO_NTFY_TOPIC` and `GHSUDO_NTFY_MODE` override the stored settings, but if *any* of them is set the mode is forced to `notify`. Approval by push always requires the stored, encrypted configuration: the agent that invokes `ghsudo` controls its environment, so an env-selectable approval channel would let it point `ghsudo` at a topic it owns and approve itself.
+**No environment-variable configuration.** ntfy settings come only from the stored, encrypted config (`ghsudo --setup-ntfy`) — never from the process environment. The agent invoking `ghsudo` controls its own child environment, so an env-settable channel would let it redirect notifications, or point `ghsudo` at a topic it owns and approve itself.
 
 ### Security trade-offs of remote-approve
 

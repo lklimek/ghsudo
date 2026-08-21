@@ -64,11 +64,6 @@ _NTFY_DEFAULT_TIMEOUT = 300  # seconds — a phone reply is slower than a click
 _NTFY_MAX_TIMEOUT = 3600
 _NTFY_PUBLISH_TIMEOUT = 10
 _NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_NTFY_ENV_OVERRIDES = {
-    "server": "GHSUDO_NTFY_SERVER",
-    "topic": "GHSUDO_NTFY_TOPIC",
-    "mode": "GHSUDO_NTFY_MODE",
-}
 _REPLY_ALLOW = "allow"
 _REPLY_DENY = "deny"
 _REPLY_TOPIC_BYTES = 24
@@ -428,11 +423,11 @@ def _generate_ntfy_topic() -> str:
     return f"ghsudo-{secrets.token_hex(8)}"
 
 
-def _build_ntfy_config(data: dict, *, env_used: bool) -> _NtfyConfig | None:
+def _build_ntfy_config(data: dict) -> _NtfyConfig | None:
     """Validate a raw settings mapping into a config, or None if unusable.
 
     Anything unrecognised is coerced towards the safe end: an unknown mode
-    becomes ``notify``, and env-sourced settings can never yield remote-approve.
+    becomes ``notify``.
     """
     topic = str(data.get("topic") or "").strip()
     if not _NTFY_TOPIC_RE.match(topic):
@@ -448,12 +443,6 @@ def _build_ntfy_config(data: dict, *, env_used: bool) -> _NtfyConfig | None:
     if mode not in _NTFY_MODES:
         _debug(f"ntfy: unknown mode {mode!r} — falling back to {_MODE_NOTIFY}")
         mode = _MODE_NOTIFY
-    if env_used and mode == _MODE_REMOTE_APPROVE:
-        _info(
-            f"ntfy: {' / '.join(_NTFY_ENV_OVERRIDES.values())} can only drive "
-            f"notifications; using mode '{_MODE_NOTIFY}'."
-        )
-        mode = _MODE_NOTIFY
 
     try:
         timeout = int(data.get("timeout", _NTFY_DEFAULT_TIMEOUT))
@@ -463,15 +452,6 @@ def _build_ntfy_config(data: dict, *, env_used: bool) -> _NtfyConfig | None:
         timeout = _NTFY_DEFAULT_TIMEOUT
 
     auth_token = data.get("auth_token") or None
-    if env_used and auth_token:
-        # An agent-controlled env var (e.g. GHSUDO_NTFY_SERVER) could redirect
-        # delivery to a listener the agent owns — never forward the stored
-        # bearer token to a destination the agent had any say in choosing.
-        _info(
-            "ntfy: env override present — dropping stored auth_token "
-            "(would otherwise be sent to an agent-selectable destination)."
-        )
-        auth_token = None
     return _NtfyConfig(
         topic=topic,
         server=server,
@@ -485,34 +465,27 @@ def _build_ntfy_config(data: dict, *, env_used: bool) -> _NtfyConfig | None:
 def _load_ntfy_config() -> _NtfyConfig | None:
     """Return the effective ntfy config, or None when not configured.
 
-    Environment overrides are honoured for server/topic/mode, but any of them
-    forces notify mode: the agent that invokes ghsudo controls its environment,
-    so an env-selectable approval channel would let it approve itself.
+    Read only from the on-disk encrypted config — never from the process
+    environment. The agent invoking ghsudo controls its own child
+    environment, so an env-settable channel (topic, server, or mode) would
+    let it redirect or approve notifications itself.
     """
     import json  # noqa: PLC0415
 
-    data: dict = {}
-    if _NOTIFY_PATH.exists():
-        try:
-            raw = _decrypt_blob(_NOTIFY_PATH.read_bytes(), _derive_machine_key())
-            data = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001 — never break a run over notifications
-            _err(f"Failed to read {_NOTIFY_PATH} ({exc}).")
-            _err("Re-run:  ghsudo --setup-ntfy")
-            return None
-        if not isinstance(data, dict):
-            _debug("ntfy: config is not a JSON object — ignoring")
-            return None
-
-    env = {
-        field: os.environ[var]
-        for field, var in _NTFY_ENV_OVERRIDES.items()
-        if os.environ.get(var)
-    }
-    if not data and not env:
+    if not _NOTIFY_PATH.exists():
+        return None
+    try:
+        raw = _decrypt_blob(_NOTIFY_PATH.read_bytes(), _derive_machine_key())
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001 — never break a run over notifications
+        _err(f"Failed to read {_NOTIFY_PATH} ({exc}).")
+        _err("Re-run:  ghsudo --setup-ntfy")
+        return None
+    if not isinstance(data, dict):
+        _debug("ntfy: config is not a JSON object — ignoring")
         return None
 
-    cfg = _build_ntfy_config({**data, **env}, env_used=bool(env))
+    cfg = _build_ntfy_config(data)
     if cfg is None or not cfg.enabled:
         return None
     return cfg

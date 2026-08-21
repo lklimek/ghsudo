@@ -24,8 +24,6 @@ def ntfy_home(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(main, "_NOTIFY_PATH", tmp_path / "notify.enc")
     monkeypatch.setattr(main, "_derive_machine_key", lambda: b"\x2a" * 32)
-    for var in main._NTFY_ENV_OVERRIDES.values():
-        monkeypatch.delenv(var, raising=False)
     return tmp_path
 
 
@@ -233,79 +231,42 @@ class TestNtfyConfigValidation:
         assert cfg.server == "https://ntfy.example"
 
 
-class TestNtfyEnvOverrides:
-    """Env vars may configure notifications but must never grant remote-approve.
+class TestNtfyEnvVarsAreInert:
+    """ntfy config comes only from the on-disk encrypted file — never the env.
 
-    The agent invoking ghsudo controls its child environment, so an env-settable
-    approval channel would let it point ghsudo at a topic it owns and self-approve.
+    The agent invoking ghsudo controls its own child environment, so an
+    env-settable channel (topic, server, or mode) would let it redirect
+    notifications, or worse, point ghsudo at a topic/server it owns.
+    GHSUDO_NTFY_{TOPIC,SERVER,MODE} are read by nothing in the codebase; these
+    tests are the regression guard against that mechanism quietly coming back.
     """
 
-    def test_env_only_config_is_notify(self, ntfy_home, monkeypatch):
-        monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "from-env")
-        cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.topic == "from-env"
-        assert cfg.mode == main._MODE_NOTIFY
-
-    def test_env_cannot_enable_remote_approve(self, ntfy_home, monkeypatch):
-        monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "from-env")
-        monkeypatch.setenv("GHSUDO_NTFY_MODE", main._MODE_REMOTE_APPROVE)
-        cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.mode == main._MODE_NOTIFY
-
-    def test_env_override_downgrades_stored_remote_approve(
-        self, ntfy_home, monkeypatch
-    ):
-        main._save_ntfy_config(_cfg(mode=main._MODE_REMOTE_APPROVE))
-        monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "hijacked")
-        cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.topic == "hijacked"
-        assert cfg.mode == main._MODE_NOTIFY
-
-    def test_stored_remote_approve_kept_without_env(self, ntfy_home):
-        main._save_ntfy_config(_cfg(mode=main._MODE_REMOTE_APPROVE))
-        cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.mode == main._MODE_REMOTE_APPROVE
-
-    def test_env_server_override_applies(self, ntfy_home, monkeypatch):
+    def test_env_vars_do_not_create_a_config(self, ntfy_home, monkeypatch):
         monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "from-env")
         monkeypatch.setenv("GHSUDO_NTFY_SERVER", "https://ntfy.internal")
-        cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.server == "https://ntfy.internal"
-
-    def test_invalid_env_topic_rejected(self, ntfy_home, monkeypatch):
-        monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "bad topic/../x")
+        monkeypatch.setenv("GHSUDO_NTFY_MODE", main._MODE_REMOTE_APPROVE)
         assert main._load_ntfy_config() is None
 
-    def test_env_server_override_drops_stored_auth_token(self, ntfy_home, monkeypatch):
-        # An agent that redirects delivery via GHSUDO_NTFY_SERVER must never
-        # get the stored bearer token forwarded to its own listener.
-        main._save_ntfy_config(_cfg(auth_token="tk_secret"))
+    def test_env_vars_do_not_affect_stored_config(self, ntfy_home, monkeypatch):
+        saved = _cfg(
+            topic="stored-topic",
+            server="https://ntfy.sh",
+            mode=main._MODE_REMOTE_APPROVE,
+            auth_token="tk_secret",
+        )
+        main._save_ntfy_config(saved)
+        monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "hijacked")
         monkeypatch.setenv("GHSUDO_NTFY_SERVER", "https://agent-controlled.example")
+        monkeypatch.setenv("GHSUDO_NTFY_MODE", main._MODE_NOTIFY)
         cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.server == "https://agent-controlled.example"
-        assert cfg.auth_token is None
+        assert cfg == saved
 
-    def test_env_topic_override_drops_stored_auth_token(self, ntfy_home, monkeypatch):
-        # Any env override at all is agent-influenced — stripping only on a
-        # server override would still leak the token whenever some other
-        # field triggers env_used, so it's dropped unconditionally.
-        main._save_ntfy_config(_cfg(auth_token="tk_secret"))
-        monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "from-env")
-        cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.auth_token is None
+    def test_build_ntfy_config_takes_no_env_parameter(self):
+        # Regression guard on the signature itself: no env/env_used knob left
+        # for a future change to accidentally wire back up.
+        import inspect
 
-    def test_no_env_override_keeps_stored_auth_token(self, ntfy_home):
-        main._save_ntfy_config(_cfg(auth_token="tk_secret"))
-        cfg = main._load_ntfy_config()
-        assert cfg is not None
-        assert cfg.auth_token == "tk_secret"
+        assert list(inspect.signature(main._build_ntfy_config).parameters) == ["data"]
 
 
 # ---------------------------------------------------------------------------

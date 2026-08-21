@@ -149,10 +149,10 @@ topic = "ghsudo-a1b2c3d4e5f6"   # user-chosen or auto-generated on setup
 timeout = 300           # seconds; independent of _GUI_TIMEOUT (phone replies are slower)
 ```
 
-Env var overrides for CI/ephemeral use, mirroring existing `GHSUDO_DEBUG`
-convention: `GHSUDO_NTFY_TOPIC`, `GHSUDO_NTFY_SERVER`, `GHSUDO_NTFY_MODE`.
-(Env overrides necessarily bypass the encryption-at-rest benefit — same
-trade-off as any env-var secret; documented, not a regression.)
+~~Env var overrides for CI/ephemeral use, mirroring existing `GHSUDO_DEBUG`
+convention: `GHSUDO_NTFY_TOPIC`, `GHSUDO_NTFY_SERVER`, `GHSUDO_NTFY_MODE`.~~
+**Removed post-implementation** — see "As implemented" delta 2 below. Config
+now comes only from the encrypted file on disk.
 
 New subcommand: `ghsudo --setup-ntfy` — prompts for server/topic (or
 generates a random topic), sends a test notification, and prints the
@@ -267,12 +267,19 @@ Deltas from the sketch above, all in the same spirit:
    TOML would need a third-party writer for no benefit. File location,
    encryption and permissions are as designed (`~/.config/ghsudo/notify.enc`,
    AES-256-GCM via the shared `_encrypt_blob`/`_decrypt_blob`, `0600`).
-2. **Env overrides can never select remote-approve.** If any of
-   `GHSUDO_NTFY_SERVER` / `GHSUDO_NTFY_TOPIC` / `GHSUDO_NTFY_MODE` is set, the
-   effective mode is forced to `notify`. The agent invoking `ghsudo` controls
-   its child environment, so an env-selectable approval channel would let it
-   point `ghsudo` at a topic it owns and approve itself — cheaper than the
-   crypto-reproduction attack the Decision section accepts, so it is closed.
+2. **Env var overrides were shipped, then removed.** The original release
+   allowed `GHSUDO_NTFY_{TOPIC,SERVER,MODE}` to override the stored config,
+   forcing mode to `notify` whenever any of them was set — the agent invoking
+   `ghsudo` controls its child environment, so an env-selectable approval
+   channel would let it point `ghsudo` at a topic it owns and approve itself.
+   A follow-up review round then found that a `GHSUDO_NTFY_SERVER` override
+   could still exfiltrate a stored `auth_token` to an agent-controlled
+   listener; the immediate fix stripped the token whenever an env override
+   was in play. On reflection the owner decided the whole mechanism wasn't
+   worth the residual attack surface for what it bought (CI/ephemeral
+   convenience), so it was removed outright: `_load_ntfy_config()` now reads
+   only from the encrypted on-disk file, full stop. No env var is consulted
+   for ntfy configuration.
 3. **Subscribe before publish.** The reply-topic stream is opened *before* the
    notification goes out, so a reply tapped the instant the push lands cannot
    arrive before anyone is listening.
