@@ -161,6 +161,19 @@ class TestNtfyConfigStorage:
         assert main._NTFY_DEFAULT_TIMEOUT == 300
         assert _cfg().timeout == 300
 
+    def test_save_creates_file_0600_even_with_permissive_umask(self, ntfy_home):
+        old_umask = os.umask(0o000)
+        try:
+            main._save_ntfy_config(_cfg(auth_token="tk_secret"))
+        finally:
+            os.umask(old_umask)
+        assert main._NOTIFY_PATH.stat().st_mode & 0o777 == 0o600
+
+    def test_save_leaves_no_stray_temp_files(self, ntfy_home):
+        main._save_ntfy_config(_cfg())
+        leftovers = [p for p in main._CONFIG_DIR.iterdir() if p.name != "notify.enc"]
+        assert leftovers == []
+
 
 class TestNtfyConfigValidation:
     """Invalid stored values must never yield a usable config."""
@@ -193,6 +206,25 @@ class TestNtfyConfigValidation:
         cfg = main._load_ntfy_config()
         assert cfg is not None
         assert cfg.timeout == main._NTFY_DEFAULT_TIMEOUT
+
+    def test_server_with_query_rejected(self, ntfy_home):
+        self._store({"topic": "ghsudo-test", "server": "https://ntfy.sh/?x=1"})
+        assert main._load_ntfy_config() is None
+
+    def test_server_with_fragment_rejected(self, ntfy_home):
+        # A fragment is never sent to the server, so the reply action URL
+        # (built by appending "/{topic}" to the whole server string) would
+        # silently publish to the wrong place.
+        self._store({"topic": "ghsudo-test", "server": "https://ntfy.sh/#x"})
+        assert main._load_ntfy_config() is None
+
+    def test_server_with_path_is_allowed(self, ntfy_home):
+        # A path is fine — e.g. a self-hosted instance behind a reverse-proxy
+        # subpath.
+        self._store({"topic": "ghsudo-test", "server": "https://example.com/ntfy"})
+        cfg = main._load_ntfy_config()
+        assert cfg is not None
+        assert cfg.server == "https://example.com/ntfy"
 
     def test_trailing_slash_stripped_from_server(self, ntfy_home):
         self._store({"topic": "ghsudo-test", "server": "https://ntfy.example/"})
@@ -248,6 +280,32 @@ class TestNtfyEnvOverrides:
     def test_invalid_env_topic_rejected(self, ntfy_home, monkeypatch):
         monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "bad topic/../x")
         assert main._load_ntfy_config() is None
+
+    def test_env_server_override_drops_stored_auth_token(self, ntfy_home, monkeypatch):
+        # An agent that redirects delivery via GHSUDO_NTFY_SERVER must never
+        # get the stored bearer token forwarded to its own listener.
+        main._save_ntfy_config(_cfg(auth_token="tk_secret"))
+        monkeypatch.setenv("GHSUDO_NTFY_SERVER", "https://agent-controlled.example")
+        cfg = main._load_ntfy_config()
+        assert cfg is not None
+        assert cfg.server == "https://agent-controlled.example"
+        assert cfg.auth_token is None
+
+    def test_env_topic_override_drops_stored_auth_token(self, ntfy_home, monkeypatch):
+        # Any env override at all is agent-influenced — stripping only on a
+        # server override would still leak the token whenever some other
+        # field triggers env_used, so it's dropped unconditionally.
+        main._save_ntfy_config(_cfg(auth_token="tk_secret"))
+        monkeypatch.setenv("GHSUDO_NTFY_TOPIC", "from-env")
+        cfg = main._load_ntfy_config()
+        assert cfg is not None
+        assert cfg.auth_token is None
+
+    def test_no_env_override_keeps_stored_auth_token(self, ntfy_home):
+        main._save_ntfy_config(_cfg(auth_token="tk_secret"))
+        cfg = main._load_ntfy_config()
+        assert cfg is not None
+        assert cfg.auth_token == "tk_secret"
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +483,33 @@ class TestNtfyChannel:
         )
         with _patch_urlopen(_fail):
             assert chan.run() is None
+
+    def test_deadline_starts_before_publish_not_after(self, monkeypatch):
+        """The reply-acceptance window must not be extended by however long
+        subscribe+publish take — it must match the GUI channel's deadline,
+        which starts at thread launch, not after those calls complete."""
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(main.time, "monotonic", lambda: clock["t"])
+
+        real_publish = main._ntfy_publish
+
+        def slow_publish(*args, **kwargs):
+            clock["t"] += 10  # simulate a slow publish, past the 5s timeout
+            return real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(main, "_ntfy_publish", slow_publish)
+
+        fake = _FakeUrlopen(stream=_FakeStream([_line("message", "allow")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            result = chan.run()
+
+        # Deadline (t=1000+5=1005) already elapsed by the time publish
+        # returns (t=1010), so this must read as a timeout/denial even
+        # though an "allow" line is sitting right there in the stream.
+        assert result is False
 
     def test_subscribes_before_publishing(self):
         """A reply tapped the instant the push lands must not be missed."""

@@ -411,6 +411,13 @@ def _normalize_server(server: str) -> str | None:
     parts = urlsplit(server)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return None
+    if parts.query or parts.fragment:
+        # Reply action URLs are built by appending "/{topic}" to the whole
+        # server string — a query or fragment component (e.g. a "#..."
+        # anchor) would silently break that, and a fragment in particular
+        # is never transmitted to the server at all. A path is fine (e.g.
+        # a self-hosted instance behind a reverse-proxy subpath).
+        return None
     return server
 
 
@@ -456,6 +463,15 @@ def _build_ntfy_config(data: dict, *, env_used: bool) -> _NtfyConfig | None:
         timeout = _NTFY_DEFAULT_TIMEOUT
 
     auth_token = data.get("auth_token") or None
+    if env_used and auth_token:
+        # An agent-controlled env var (e.g. GHSUDO_NTFY_SERVER) could redirect
+        # delivery to a listener the agent owns — never forward the stored
+        # bearer token to a destination the agent had any say in choosing.
+        _info(
+            "ntfy: env override present — dropping stored auth_token "
+            "(would otherwise be sent to an agent-selectable destination)."
+        )
+        auth_token = None
     return _NtfyConfig(
         topic=topic,
         server=server,
@@ -503,16 +519,32 @@ def _load_ntfy_config() -> _NtfyConfig | None:
 
 
 def _save_ntfy_config(cfg: _NtfyConfig) -> None:
-    """Write the config encrypted, readable only by this user."""
+    """Write the config encrypted, readable only by this user.
+
+    Created with mode 0600 from the first open (not chmod'd afterwards) and
+    atomically renamed into place, so no other local user can ever observe a
+    window where the blob exists at the umask's default (often world/group
+    readable) permissions.
+    """
     import json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
 
     blob = _encrypt_blob(json.dumps(asdict(cfg)), _derive_machine_key())
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    _NOTIFY_PATH.write_bytes(blob)
+
+    fd, tmp_name = tempfile.mkstemp(dir=_CONFIG_DIR, prefix=".notify-", suffix=".tmp")
+    tmp_path = Path(tmp_name)
     try:
-        _NOTIFY_PATH.chmod(0o600)
-    except OSError:
-        pass  # Windows — rely on user-profile ACLs
+        try:
+            tmp_path.chmod(0o600)
+        except OSError:
+            pass  # Windows — rely on user-profile ACLs
+        with os.fdopen(fd, "wb") as f:
+            f.write(blob)
+        tmp_path.replace(_NOTIFY_PATH)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _ntfy_headers(cfg: _NtfyConfig) -> dict[str, str]:
@@ -673,6 +705,12 @@ class _NtfyChannel:
         import secrets  # noqa: PLC0415
         from urllib.request import Request, urlopen  # noqa: PLC0415
 
+        # Started before subscribing/publishing, matching the GUI channel's
+        # deadline (which starts at thread launch) — otherwise the time spent
+        # opening the reply stream and posting the push would silently extend
+        # the phone's reply window past what the GUI dialog actually waits.
+        deadline = time.monotonic() + self._cfg.timeout
+
         reply_topic = f"ghsudo-{secrets.token_urlsafe(_REPLY_TOPIC_BYTES)}"
 
         # Subscribe before publishing: a reply tapped the instant the push
@@ -694,14 +732,14 @@ class _NtfyChannel:
             self._stream = stream
 
         try:
-            return self._await_reply(stream, reply_topic)
+            return self._await_reply(stream, reply_topic, deadline)
         finally:
             try:
                 stream.close()
             except OSError:
                 pass
 
-    def _await_reply(self, stream, reply_topic: str) -> bool | None:
+    def _await_reply(self, stream, reply_topic: str, deadline: float) -> bool | None:
         if not _ntfy_publish(
             self._cfg,
             topic=self._cfg.topic,
@@ -718,7 +756,6 @@ class _NtfyChannel:
             f"ntfy: approval request sent to '{self._cfg.topic}' "
             f"(waiting up to {self._cfg.timeout}s)"
         )
-        deadline = time.monotonic() + self._cfg.timeout
         timed_out = False
         try:
             for line in stream:
