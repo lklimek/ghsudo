@@ -676,6 +676,32 @@ class _NtfyChannel:
                 stream.close()
             except OSError:
                 pass
+        self._notify_already_handled()
+
+    def _notify_already_handled(self) -> None:
+        """Best-effort, fire-and-forget: ntfy has no API to retract a
+        delivered push, so the original Allow/Deny notification stays
+        visible on the phone even after another channel decided. Send a
+        follow-up so the phone reflects that it's no longer actionable,
+        instead of looking like ghsudo is still waiting on it.
+        """
+
+        def _send() -> None:
+            try:
+                _ntfy_publish(
+                    self._cfg,
+                    topic=self._cfg.topic,
+                    title="ghsudo: request no longer active",
+                    message=(
+                        "This approval request was already resolved elsewhere "
+                        "(or expired) — no action needed."
+                    ),
+                    tags="information_source",
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort only
+                _debug(f"ntfy: already-handled notice failed: {exc}")
+
+        threading.Thread(target=_send, daemon=True).start()
 
     def run(self) -> bool | None:
         import secrets  # noqa: PLC0415
@@ -827,16 +853,70 @@ def _escape_for_powershell(s: str) -> str:
     return s.replace("`", "``").replace('"', '`"').replace("$", "`$")
 
 
+class _GuiCancel:
+    """Cross-thread cancellation for the GUI dialog channel.
+
+    Unlike a bare ``threading.Event``, ``set()`` kills the currently-running
+    dialog subprocess immediately and synchronously, on the calling thread —
+    it does not rely on ``_run_gui``'s own polling loop (running in a daemon
+    thread) to notice and react. That cannot be guaranteed to happen before
+    the whole process exits: a daemon thread is hard-killed on interpreter
+    shutdown with no chance to run its cleanup, so if the winning channel
+    lets ``ghsudo`` proceed and exit quickly, a loser dialog relying only on
+    polling can be orphaned — process gone, subprocess (and its window)
+    still alive with nothing left to ever kill it.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    def set(self) -> None:
+        """Cancel, killing any dialog subprocess currently registered."""
+        self._event.set()
+        with self._lock:
+            proc, self._proc = self._proc, None
+        if proc is not None:
+            _kill_gui(proc)
+
+    def register(self, proc: subprocess.Popen) -> bool:
+        """Track *proc* as the active dialog.
+
+        Returns False (having already killed *proc*) if cancellation
+        happened before registration could complete.
+        """
+        with self._lock:
+            if self._event.is_set():
+                already_cancelled = True
+            else:
+                self._proc = proc
+                already_cancelled = False
+        if already_cancelled:
+            _kill_gui(proc)
+        return not already_cancelled
+
+    def unregister(self) -> None:
+        with self._lock:
+            self._proc = None
+
+
 def _run_gui(
     cmd: list[str],
     *,
     timeout: int = _GUI_TIMEOUT,
-    cancel: threading.Event | None = None,
+    cancel: _GuiCancel | None = None,
 ) -> int | None:
     """Run a GUI command with timeout. Returns exit code, or None if not found.
 
     Returns 1 (denial) on timeout — the user didn't respond in time.
-    Returns None when the tool is not installed, or when *cancel* is set
+    Returns None when the tool is not installed, or when *cancel* fires
     because another approval channel answered first.
     """
     _debug(f"gui: launching {cmd[0]}")
@@ -850,27 +930,38 @@ def _run_gui(
         _debug(f"gui: {cmd[0]} not found")
         return None
 
-    deadline = time.monotonic() + timeout
-    while True:
-        wait = deadline - time.monotonic()
+    if cancel is not None and not cancel.register(proc):
+        _debug(f"gui: {cmd[0]} dismissed before it could show — already cancelled")
+        return None
+
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            wait = deadline - time.monotonic()
+            if cancel is not None:
+                wait = min(wait, _CANCEL_POLL_INTERVAL)
+            if wait > 0:
+                try:
+                    proc.wait(timeout=wait)
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    if cancel is not None and cancel.is_set():
+                        # cancel.set() killed us mid-wait — not a real answer.
+                        return None
+                    _debug(f"gui: {cmd[0]} exited with {proc.returncode}")
+                    return proc.returncode
+            if cancel is not None and cancel.is_set():
+                _debug(f"gui: {cmd[0]} dismissed — another channel answered")
+                return None
+            if time.monotonic() >= deadline:
+                _debug(f"gui: {cmd[0]} timed out after {timeout}s, auto-denying")
+                _kill_gui(proc)
+                _info(f"Dialog timed out after {timeout}s — auto-denied.")
+                return 1  # treat as denial, not as tool-unavailable
+    finally:
         if cancel is not None:
-            wait = min(wait, _CANCEL_POLL_INTERVAL)
-        if wait > 0:
-            try:
-                proc.wait(timeout=wait)
-                _debug(f"gui: {cmd[0]} exited with {proc.returncode}")
-                return proc.returncode
-            except subprocess.TimeoutExpired:
-                pass
-        if cancel is not None and cancel.is_set():
-            _debug(f"gui: {cmd[0]} dismissed — another channel answered")
-            _kill_gui(proc)
-            return None
-        if time.monotonic() >= deadline:
-            _debug(f"gui: {cmd[0]} timed out after {timeout}s, auto-denying")
-            _kill_gui(proc)
-            _info(f"Dialog timed out after {timeout}s — auto-denied.")
-            return 1  # treat as denial, not as tool-unavailable
+            cancel.unregister()
 
 
 def _kill_gui(proc: subprocess.Popen) -> None:
@@ -899,7 +990,7 @@ def _ask_xmessage(
     repo: str | None = None,
     *,
     timeout: int = _GUI_TIMEOUT,
-    cancel: threading.Event | None = None,
+    cancel: _GuiCancel | None = None,
 ) -> bool | None:
     """Lightweight X11 dialog. Returns True=approved, False=denied, None=unavailable."""
     msg = _format_approval_msg(cmd_str, org, repo)
@@ -933,7 +1024,7 @@ def _ask_zenity(
     repo: str | None = None,
     *,
     timeout: int = _GUI_TIMEOUT,
-    cancel: threading.Event | None = None,
+    cancel: _GuiCancel | None = None,
 ) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     msg = _format_approval_msg(cmd_str, org, repo)
@@ -961,7 +1052,7 @@ def _ask_kdialog(
     repo: str | None = None,
     *,
     timeout: int = _GUI_TIMEOUT,
-    cancel: threading.Event | None = None,
+    cancel: _GuiCancel | None = None,
 ) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     msg = _format_approval_msg(cmd_str, org, repo)
@@ -991,7 +1082,7 @@ def _ask_osascript(
     repo: str | None = None,
     *,
     timeout: int = _GUI_TIMEOUT,
-    cancel: threading.Event | None = None,
+    cancel: _GuiCancel | None = None,
 ) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     escaped = _escape_for_applescript(
@@ -1016,7 +1107,7 @@ def _ask_powershell(
     repo: str | None = None,
     *,
     timeout: int = _GUI_TIMEOUT,
-    cancel: threading.Event | None = None,
+    cancel: _GuiCancel | None = None,
 ) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
     escaped = _escape_for_powershell(cmd_str)
@@ -1057,7 +1148,7 @@ def _ask_gui(
     repo: str | None = None,
     *,
     timeout: int = _GUI_TIMEOUT,
-    cancel: threading.Event | None = None,
+    cancel: _GuiCancel | None = None,
 ) -> bool | None:
     """Ask via the platform's dialog. None means no toolkit could show it."""
     system = platform.system()
@@ -1093,7 +1184,7 @@ def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
 
     # While the phone can still answer, the dialog must stay up just as long.
     timeout = max(_GUI_TIMEOUT, cfg.timeout) if remote and cfg else _GUI_TIMEOUT
-    cancel = threading.Event()
+    cancel = _GuiCancel()
     channels: list[_Channel] = []
     if has_display:
         channels.append(

@@ -518,6 +518,36 @@ class TestNtfyChannel:
             chan.run()
         assert order == ["subscribe", "publish"]
 
+    def test_cancel_sends_an_already_handled_follow_up(self):
+        # ntfy has no API to retract a delivered push — the original
+        # Allow/Deny notification stays on the phone regardless. cancel()
+        # sends a follow-up so it doesn't look like ghsudo is still waiting
+        # on a request that was actually decided elsewhere.
+        fake = _FakeUrlopen(stream=_FakeStream([]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(fake):
+            chan.cancel()
+            for _ in range(50):
+                if len(fake.published) >= 1:
+                    break
+                time.sleep(0.02)
+        assert any(
+            p["topic"] == "ghsudo-test" and "no longer active" in p["title"]
+            for p in fake.published
+        )
+
+    def test_cancel_follow_up_failure_does_not_raise(self):
+        # Best-effort: a broken network must not surface as an exception
+        # from cancel() itself.
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5), "cmd", "acme", None
+        )
+        with _patch_urlopen(lambda *a, **k: (_ for _ in ()).throw(OSError("down"))):
+            chan.cancel()  # must not raise
+            time.sleep(0.05)
+
     def test_reply_topic_is_fresh_and_never_the_configured_topic(self):
         seen = set()
         for _ in range(3):
@@ -675,11 +705,48 @@ class TestRunGui:
         assert time.monotonic() - begin < 10
 
     def test_cancel_dismisses_the_dialog(self):
-        cancel = threading.Event()
+        cancel = main._GuiCancel()
         threading.Timer(0.3, cancel.set).start()
         begin = time.monotonic()
         assert main._run_gui(["/bin/sleep", "30"], timeout=60, cancel=cancel) is None
         assert time.monotonic() - begin < 10
+
+    def test_cancel_kills_the_subprocess_immediately(self):
+        # Regression: cancel.set() must kill the dialog subprocess itself,
+        # synchronously, on the calling thread — not just flip a flag for
+        # _run_gui's own (daemon) polling thread to notice on its own time.
+        # A daemon thread killed by process exit before its next poll would
+        # never run the kill at all, orphaning the dialog window.
+        cancel = main._GuiCancel()
+
+        thread = threading.Thread(
+            target=main._run_gui,
+            args=(["/bin/sleep", "30"],),
+            kwargs={"timeout": 60, "cancel": cancel},
+        )
+        thread.start()
+
+        # Wait until the subprocess is actually registered so we cancel a
+        # live process, not a not-yet-launched one.
+        proc = None
+        for _ in range(100):
+            with cancel._lock:
+                proc = cancel._proc
+            if proc is not None:
+                break
+            time.sleep(0.02)
+        assert proc is not None, "dialog subprocess never registered"
+
+        begin = time.monotonic()
+        cancel.set()
+        elapsed = time.monotonic() - begin
+        # set() itself must have killed it — no poll interval to wait out.
+        # A generous margin under _CANCEL_POLL_INTERVAL (0.2s) so this still
+        # fails if a regression falls back to polling for the kill instead
+        # of doing it synchronously inside set().
+        assert elapsed < 0.1
+        assert proc.poll() is not None
+        thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
