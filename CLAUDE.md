@@ -35,14 +35,18 @@ When bumping the version, edit **only** `pyproject.toml`.
 
 ## Testing
 
+The package is not installed in the dev environment, so point Python at `src/`
+(or run `pip install -e .` first, as CI does):
+
 ```bash
-python -m pytest tests/ -v
+PYTHONPATH=src python3 -m pytest tests/ -v
 ```
 
-Only run formatting/linting right before committing:
+Only run formatting/linting right before committing (`ruff` is a standalone
+binary, not a Python module):
 
 ```bash
-python -m ruff check src/ tests/ && python -m ruff format src/ tests/
+ruff check src/ tests/ && ruff format src/ tests/
 ```
 
 ## Release process

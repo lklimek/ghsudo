@@ -1180,3 +1180,131 @@ class TestVerifyAndList:
 
     def test_usage_documents_setup_ntfy(self):
         assert "--setup-ntfy" in main._USAGE
+
+
+# ---------------------------------------------------------------------------
+# Topic name stays off the screen unless --verbose
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    monkeypatch.setattr(main, "_VERBOSE", False)
+
+
+class TestTopicNotShown:
+    """The long-lived topic is semi-secret: shown only in verbose mode."""
+
+    def test_approval_request_hides_topic(self, quiet, capsys):
+        fake = _FakeUrlopen(stream=_FakeStream([_line("message", "allow")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5),
+            "gh pr merge 1",
+            "acme",
+            None,
+        )
+        with _patch_urlopen(fake):
+            assert chan.run() is True
+        err = capsys.readouterr().err
+        assert "approval request sent" in err
+        assert "ghsudo-test" not in err
+
+    def test_approval_request_shows_topic_when_verbose(self, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_VERBOSE", True)
+        fake = _FakeUrlopen(stream=_FakeStream([_line("message", "allow")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5),
+            "gh pr merge 1",
+            "acme",
+            None,
+        )
+        with _patch_urlopen(fake):
+            chan.run()
+        assert "ghsudo-test" in capsys.readouterr().err
+
+    def test_verify_hides_topic(self, quiet, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        with _patch_urlopen(_FakeUrlopen()):
+            main.cmd_verify()
+        assert "ghsudo-test" not in capsys.readouterr().err
+
+    def test_list_hides_topic(self, quiet, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        main.cmd_list()
+        err = capsys.readouterr().err
+        assert "ntfy: configured" in err
+        assert "ghsudo-test" not in err
+
+    def test_list_shows_topic_when_verbose(self, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_VERBOSE", True)
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        main.cmd_list()
+        assert "ghsudo-test" in capsys.readouterr().err
+
+    def test_verbose_flag_enables_verbose(self, quiet, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main.sys, "argv", ["ghsudo", "--verbose", "--list"])
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        assert main.main() == main.EXIT_OK
+        assert "ghsudo-test" in capsys.readouterr().err
+
+    def test_short_verbose_flag(self, quiet, monkeypatch):
+        monkeypatch.setattr(main.sys, "argv", ["ghsudo", "-v", "--list"])
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        monkeypatch.setattr(main, "_load_ntfy_config", lambda: None)
+        main.main()
+        assert main._VERBOSE is True
+
+    def test_usage_documents_verbose(self):
+        assert "--verbose" in main._USAGE
+
+
+# ---------------------------------------------------------------------------
+# Denial exit code
+# ---------------------------------------------------------------------------
+
+
+class TestDenialExitCode:
+    """A denial — explicit or by timeout — must exit EXIT_DENIED, never 0."""
+
+    @pytest.fixture
+    def headless_remote(self, monkeypatch):
+        monkeypatch.setattr(
+            main,
+            "_load_ntfy_config",
+            lambda: _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5),
+        )
+        monkeypatch.setattr(main, "_has_display", lambda: False)
+        monkeypatch.setattr(main, "_load_token", lambda org: "gh-token")
+        monkeypatch.setattr(main, "_detect_repo_slug", lambda cmd: None)
+        monkeypatch.setattr(
+            main.subprocess,
+            "run",
+            MagicMock(side_effect=AssertionError("denied command must not run")),
+        )
+
+    def test_ntfy_auto_deny_exits_denied(self, headless_remote, monkeypatch):
+        stream = _FakeStream([_line("keepalive")], raise_at_end=TimeoutError())
+        monkeypatch.setattr(
+            main.sys, "argv", ["ghsudo", "--org", "acme", "git", "push"]
+        )
+        with _patch_urlopen(_FakeUrlopen(stream=stream)):
+            assert main.main() == main.EXIT_DENIED
+
+    def test_ntfy_explicit_deny_exits_denied(self, headless_remote, monkeypatch):
+        stream = _FakeStream([_line("message", "deny")])
+        monkeypatch.setattr(
+            main.sys, "argv", ["ghsudo", "--org", "acme", "git", "push"]
+        )
+        with _patch_urlopen(_FakeUrlopen(stream=stream)):
+            assert main.main() == main.EXIT_DENIED
+
+    def test_gui_timeout_exits_denied(self, no_ntfy, monkeypatch):
+        monkeypatch.setattr(main, "_has_display", lambda: True)
+        monkeypatch.setattr(main, "_load_token", lambda org: "gh-token")
+        monkeypatch.setattr(main, "_detect_repo_slug", lambda cmd: None)
+        monkeypatch.setattr(main, "_ask_gui", lambda *a, **k: False)
+        assert main.cmd_run(["git", "push"], org="acme") == main.EXIT_DENIED

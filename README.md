@@ -104,6 +104,8 @@ Options:
   --verify [ORG]  Verify stored token(s) and the ntfy connection
   --revoke [ORG]  Revoke stored token(s)
   --list          List orgs with stored tokens
+  -v, --verbose   Verbose output: timings and the ntfy topic name
+                  (same as GHSUDO_DEBUG=1)
   -h, --help      Show this help
 ```
 
@@ -167,7 +169,7 @@ ghsudo --setup-ntfy --mode remote-approve --server https://ntfy.example.com --to
 
 Setup sends a test notification and stores the settings encrypted at `~/.config/ghsudo/notify.enc` (same AES-256-GCM scheme as the tokens, permissions `0600`). Subscribe to the topic in the ntfy mobile app to receive requests. `ghsudo --verify` re-tests the connection, and `ghsudo --list` shows the configured mode.
 
-**How remote-approve works:** each request publishes a notification whose Allow/Deny buttons post to a **freshly generated, single-use reply topic** that is never written to disk. `ghsudo` waits up to **300 seconds** for the reply; no reply means denial. If a display is also available, the desktop dialog and the push race each other — the first decisive answer wins and the other is dismissed.
+**How remote-approve works:** each request publishes a notification whose Allow/Deny buttons post to a **freshly generated, single-use reply topic** that is never written to disk. `ghsudo` waits up to **300 seconds** for the reply; no reply means denial. If a display is also available, the desktop dialog and the push race each other — the first decisive answer wins and the other is dismissed. A dialog that crashes or loses its display connection (e.g. a dropped `ssh -X` session) is not a denial — the push keeps waiting for your answer.
 
 **No environment-variable configuration.** ntfy settings come only from the stored, encrypted config (`ghsudo --setup-ntfy`) — never from the process environment. The agent invoking `ghsudo` controls its own child environment, so an env-settable channel would let it redirect notifications, or point `ghsudo` at a topic it owns and approve itself.
 
@@ -200,8 +202,11 @@ Setup sends a test notification and stores the settings encrypted at `~/.config/
 
 ## Debugging
 
-Set `GHSUDO_DEBUG=1` to enable verbose timing output on stderr:
+Pass `-v`/`--verbose` (or set `GHSUDO_DEBUG=1`) to enable verbose timing output on stderr:
 
 ```bash
+ghsudo --verbose gh pr list
 GHSUDO_DEBUG=1 ghsudo gh pr list
 ```
+
+The ntfy topic name is treated as semi-secret: outside `--setup-ntfy` it is only printed in verbose mode.
