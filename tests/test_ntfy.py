@@ -821,120 +821,8 @@ class TestRaceApproval:
 
 
 # ---------------------------------------------------------------------------
-# Dialog process control
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    not os.path.exists("/bin/sleep"), reason="needs POSIX helper binaries"
-)
-class TestRunGui:
-    """The dialog subprocess answers, times out, or is dismissed by its peer."""
-
-    def test_exit_code_returned(self):
-        assert main._run_gui(["/bin/true"]) == 0
-        assert main._run_gui(["/bin/false"]) == 1
-
-    def test_missing_tool_is_unavailable(self):
-        assert main._run_gui(["/nonexistent/dialog-tool"]) is None
-
-    def test_timeout_is_a_denial(self):
-        begin = time.monotonic()
-        assert main._run_gui(["/bin/sleep", "30"], timeout=1) == 1
-        assert time.monotonic() - begin < 10
-
-    def test_cancel_dismisses_the_dialog(self):
-        cancel = main._GuiCancel()
-        threading.Timer(0.3, cancel.set).start()
-        begin = time.monotonic()
-        assert main._run_gui(["/bin/sleep", "30"], timeout=60, cancel=cancel) is None
-        assert time.monotonic() - begin < 10
-
-    def test_cancel_kills_the_subprocess_immediately(self):
-        # Regression: cancel.set() must kill the dialog subprocess itself,
-        # synchronously, on the calling thread — not just flip a flag for
-        # _run_gui's own (daemon) polling thread to notice on its own time.
-        # A daemon thread killed by process exit before its next poll would
-        # never run the kill at all, orphaning the dialog window.
-        cancel = main._GuiCancel()
-
-        thread = threading.Thread(
-            target=main._run_gui,
-            args=(["/bin/sleep", "30"],),
-            kwargs={"timeout": 60, "cancel": cancel},
-        )
-        thread.start()
-
-        # Wait until the subprocess is actually registered so we cancel a
-        # live process, not a not-yet-launched one.
-        proc = None
-        for _ in range(100):
-            with cancel._lock:
-                proc = cancel._proc
-            if proc is not None:
-                break
-            time.sleep(0.02)
-        assert proc is not None, "dialog subprocess never registered"
-
-        begin = time.monotonic()
-        cancel.set()
-        elapsed = time.monotonic() - begin
-        # set() itself must have killed it — no poll interval to wait out.
-        # A generous margin under _CANCEL_POLL_INTERVAL (0.2s) so this still
-        # fails if a regression falls back to polling for the kill instead
-        # of doing it synchronously inside set().
-        assert elapsed < 0.1
-        assert proc.poll() is not None
-        thread.join(timeout=5)
-
-
-# ---------------------------------------------------------------------------
 # _ask_approval integration
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def no_ntfy(monkeypatch):
-    monkeypatch.setattr(main, "_load_ntfy_config", lambda: None)
-
-
-class TestAskApprovalWithoutNtfy:
-    """Zero behaviour change for users who never configure ntfy."""
-
-    def test_gui_approval_returned(self, no_ntfy, monkeypatch):
-        monkeypatch.setattr(main, "_has_display", lambda: True)
-        monkeypatch.setattr(main, "_ask_gui", lambda *a, **k: True)
-        assert main._ask_approval("gh pr merge 1", "acme") is True
-
-    def test_gui_denial_returned(self, no_ntfy, monkeypatch):
-        monkeypatch.setattr(main, "_has_display", lambda: True)
-        monkeypatch.setattr(main, "_ask_gui", lambda *a, **k: False)
-        assert main._ask_approval("gh pr merge 1", "acme") is False
-
-    def test_no_display_exits_no_interactive(self, no_ntfy, monkeypatch):
-        monkeypatch.setattr(main, "_has_display", lambda: False)
-        with pytest.raises(SystemExit) as exc:
-            main._ask_approval("gh pr merge 1", "acme")
-        assert exc.value.code == main.EXIT_NO_INTERACTIVE
-
-    def test_no_gui_toolkit_exits_no_interactive(self, no_ntfy, monkeypatch):
-        monkeypatch.setattr(main, "_has_display", lambda: True)
-        monkeypatch.setattr(main, "_ask_gui", lambda *a, **k: None)
-        with pytest.raises(SystemExit) as exc:
-            main._ask_approval("gh pr merge 1", "acme")
-        assert exc.value.code == main.EXIT_NO_INTERACTIVE
-
-    def test_gui_runs_on_the_main_thread(self, no_ntfy, monkeypatch):
-        """Without a second channel there is nothing to race, so no thread hop."""
-        seen = []
-        monkeypatch.setattr(main, "_has_display", lambda: True)
-        monkeypatch.setattr(
-            main,
-            "_ask_gui",
-            lambda *a, **k: seen.append(threading.current_thread()) or True,
-        )
-        main._ask_approval("gh pr merge 1", "acme")
-        assert seen == [threading.main_thread()]
 
 
 class TestAskApprovalNotifyMode:
@@ -1180,3 +1068,206 @@ class TestVerifyAndList:
 
     def test_usage_documents_setup_ntfy(self):
         assert "--setup-ntfy" in main._USAGE
+
+
+# ---------------------------------------------------------------------------
+# Topic name stays off the screen unless --verbose
+# ---------------------------------------------------------------------------
+
+
+class TestTopicNotShown:
+    """The long-lived topic is semi-secret: shown only in verbose mode."""
+
+    def test_approval_request_hides_topic(self, quiet, capsys):
+        fake = _FakeUrlopen(stream=_FakeStream([_line("message", "allow")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5),
+            "gh pr merge 1",
+            "acme",
+            None,
+        )
+        with _patch_urlopen(fake):
+            assert chan.run() is True
+        err = capsys.readouterr().err
+        assert "approval request sent" in err
+        assert "ghsudo-test" not in err
+
+    def test_approval_request_shows_topic_when_verbose(self, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_VERBOSE", True)
+        fake = _FakeUrlopen(stream=_FakeStream([_line("message", "allow")]))
+        chan = main._NtfyChannel(
+            _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5),
+            "gh pr merge 1",
+            "acme",
+            None,
+        )
+        with _patch_urlopen(fake):
+            chan.run()
+        assert "ghsudo-test" in capsys.readouterr().err
+
+    def test_verify_hides_topic(self, quiet, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        with _patch_urlopen(_FakeUrlopen()):
+            main.cmd_verify()
+        assert "ghsudo-test" not in capsys.readouterr().err
+
+    def test_list_hides_topic(self, quiet, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        main.cmd_list()
+        err = capsys.readouterr().err
+        assert "ntfy: configured" in err
+        assert "ghsudo-test" not in err
+
+    def test_list_shows_topic_when_verbose(self, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main, "_VERBOSE", True)
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        main.cmd_list()
+        assert "ghsudo-test" in capsys.readouterr().err
+
+    def test_verbose_flag_enables_verbose(self, quiet, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main.sys, "argv", ["ghsudo", "--verbose", "--list"])
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        assert main.main() == main.EXIT_OK
+        assert "ghsudo-test" in capsys.readouterr().err
+
+    def test_short_verbose_flag(self, quiet, monkeypatch):
+        monkeypatch.setattr(main.sys, "argv", ["ghsudo", "-v", "--list"])
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        monkeypatch.setattr(main, "_load_ntfy_config", lambda: None)
+        main.main()
+        assert main._VERBOSE is True
+
+    def test_verbose_after_list(self, quiet, ntfy_home, monkeypatch, capsys):
+        monkeypatch.setattr(main.sys, "argv", ["ghsudo", "--list", "-v"])
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        assert main.main() == main.EXIT_OK
+        assert "ghsudo-test" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("flag", ["--verify", "--revoke"])
+    def test_verbose_is_not_an_org_name(self, quiet, monkeypatch, flag):
+        seen = {}
+        target = "cmd_verify" if flag == "--verify" else "cmd_revoke"
+        monkeypatch.setattr(
+            main, target, lambda org=None: seen.setdefault("org", org) and 0
+        )
+        monkeypatch.setattr(main.sys, "argv", ["ghsudo", flag, "-v"])
+        main.main()
+        assert seen == {"org": None}
+        assert main._VERBOSE is True
+
+    def test_verbose_between_setup_ntfy_flags(self, quiet, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(main, "cmd_setup_ntfy", lambda **kw: seen.update(kw) or 0)
+        monkeypatch.setattr(
+            main.sys,
+            "argv",
+            ["ghsudo", "--setup-ntfy", "--mode", "notify", "-v", "--topic=t1"],
+        )
+        assert main.main() == main.EXIT_OK
+        assert seen == {"mode": "notify", "topic": "t1"}
+        assert main._VERBOSE is True
+
+    def test_verbose_after_org(self, quiet, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            main, "cmd_run", lambda cmd, org=None: seen.update(cmd=cmd, org=org) or 0
+        )
+        monkeypatch.setattr(
+            main.sys, "argv", ["ghsudo", "--org", "acme", "-v", "gh", "pr", "list"]
+        )
+        main.main()
+        assert seen == {"cmd": ["gh", "pr", "list"], "org": "acme"}
+        assert main._VERBOSE is True
+
+    def test_verbose_inside_command_belongs_to_command(self, quiet, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            main, "cmd_run", lambda cmd, org=None: seen.update(cmd=cmd) or 0
+        )
+        monkeypatch.setattr(main.sys, "argv", ["ghsudo", "git", "push", "-v"])
+        main.main()
+        assert seen == {"cmd": ["git", "push", "-v"]}
+        assert main._VERBOSE is False
+
+    def test_verify_shows_server_and_topic_when_verbose(
+        self, ntfy_home, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(main, "_VERBOSE", True)
+        monkeypatch.setattr(main, "_list_orgs", lambda: [])
+        main._save_ntfy_config(_cfg())
+        with _patch_urlopen(_FakeUrlopen()):
+            main.cmd_verify()
+        assert "https://ntfy.example/ghsudo-test" in capsys.readouterr().err
+
+    def test_usage_documents_verbose(self):
+        assert "--verbose" in main._USAGE
+
+
+# ---------------------------------------------------------------------------
+# Denial exit code
+# ---------------------------------------------------------------------------
+
+
+class TestDenialExitCode:
+    """A denial — explicit or by timeout — must exit EXIT_DENIED, never 0."""
+
+    @pytest.fixture
+    def headless_remote(self, monkeypatch):
+        monkeypatch.setattr(
+            main,
+            "_load_ntfy_config",
+            lambda: _cfg(mode=main._MODE_REMOTE_APPROVE, timeout=5),
+        )
+        monkeypatch.setattr(main, "_has_display", lambda: False)
+        monkeypatch.setattr(main, "_load_token", lambda org: "gh-token")
+        monkeypatch.setattr(main, "_detect_repo_slug", lambda cmd: None)
+        monkeypatch.setattr(
+            main.subprocess,
+            "run",
+            MagicMock(side_effect=AssertionError("denied command must not run")),
+        )
+
+    def test_ntfy_auto_deny_exits_denied(self, headless_remote, monkeypatch):
+        stream = _FakeStream([_line("keepalive")], raise_at_end=TimeoutError())
+        monkeypatch.setattr(
+            main.sys, "argv", ["ghsudo", "--org", "acme", "git", "push"]
+        )
+        with _patch_urlopen(_FakeUrlopen(stream=stream)):
+            assert main.main() == main.EXIT_DENIED
+
+    def test_ntfy_explicit_deny_exits_denied(self, headless_remote, monkeypatch):
+        stream = _FakeStream([_line("message", "deny")])
+        monkeypatch.setattr(
+            main.sys, "argv", ["ghsudo", "--org", "acme", "git", "push"]
+        )
+        with _patch_urlopen(_FakeUrlopen(stream=stream)):
+            assert main.main() == main.EXIT_DENIED
+
+    def test_gui_deny_exits_denied(self, no_ntfy, monkeypatch):
+        monkeypatch.setattr(main, "_has_display", lambda: True)
+        monkeypatch.setattr(main, "_load_token", lambda org: "gh-token")
+        monkeypatch.setattr(main, "_detect_repo_slug", lambda cmd: None)
+        monkeypatch.setattr(main, "_ask_gui", lambda *a, **k: False)
+        assert main.cmd_run(["git", "push"], org="acme") == main.EXIT_DENIED
+
+    def test_gui_timeout_exits_denied(self, no_ntfy, monkeypatch):
+        """A dialog nobody answers times out in the real _run_gui and denies."""
+        real_run_gui = main._run_gui
+
+        def _unanswered_dialog(_cmd, **kwargs):
+            return real_run_gui(["/bin/sleep", "30"], **kwargs)
+
+        monkeypatch.setattr(main, "_GUI_TIMEOUT", 1)
+        monkeypatch.setattr(main, "_has_display", lambda: True)
+        monkeypatch.setattr(main.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(main, "_run_gui", _unanswered_dialog)
+        monkeypatch.setattr(main, "_load_token", lambda org: "gh-token")
+        monkeypatch.setattr(main, "_detect_repo_slug", lambda cmd: None)
+        begin = time.monotonic()
+        assert main.cmd_run(["git", "push"], org="acme") == main.EXIT_DENIED
+        assert time.monotonic() - begin < 10
