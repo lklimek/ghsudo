@@ -26,6 +26,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -646,8 +647,8 @@ def _ntfy_delete(
 
 
 def _format_ntfy_message(cmd_str: str, org: str, repo: str | None) -> str:
-    target = f"Repository: {repo}" if repo else f"Organization: {org}"
-    return f"{target}\nCommand: {cmd_str}"
+    target = f"Repository: {_display_safe(repo)}" if repo else f"Organization: {org}"
+    return f"{target}\nCommand: {_display_safe(cmd_str)}"
 
 
 def _notify_async(
@@ -1126,8 +1127,8 @@ def _raise_if_dialog_failed(name: str, proc: subprocess.Popen) -> None:
     try:
         # Bounded: a lingering grandchild could hold the pipe open forever.
         _out, err = proc.communicate(timeout=1)
-    except subprocess.TimeoutExpired:
-        err = b""
+    except subprocess.TimeoutExpired as exc:
+        err = exc.stderr  # whatever the dialog wrote before it exited
     stderr = (err or b"").decode(errors="replace")
     if _DISPLAY_ERROR_RE.search(stderr):
         _debug(f"gui: {name} display failure: {stderr.strip()}")
@@ -1144,32 +1145,52 @@ def _kill_gui(proc: subprocess.Popen) -> None:
         pass
 
 
-def _wrap_command(cmd_str: str) -> list[str]:
-    """Wrap *cmd_str* into indented dialog lines, keeping every character.
+_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+# Line/paragraph separators, controls and invisible format characters (bidi
+# overrides, zero-width marks): a dialog toolkit may break lines on them or
+# reorder text around them, letting a crafted command fake dialog lines.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
+
+
+def _display_safe(text: str) -> str:
+    """Escape every character that could alter how *text* is laid out."""
+    out: list[str] = []
+    for ch in text:
+        if ch in _NAMED_ESCAPES:
+            out.append(_NAMED_ESCAPES[ch])
+        elif unicodedata.category(ch) in _UNSAFE_CATEGORIES:
+            cp = ord(ch)
+            if cp < 0x100:
+                out.append(f"\\x{cp:02x}")
+            elif cp < 0x10000:
+                out.append(f"\\u{cp:04x}")
+            else:
+                out.append(f"\\U{cp:08x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _wrap_command(text: str) -> list[str]:
+    """Wrap display-safe *text* into indented dialog lines, keeping every character.
 
     Whitespace is neither collapsed nor dropped at the break points, so the
-    lines (minus the indent) concatenate back to the exact command.
+    lines (minus the indent) concatenate back to the exact text.
     """
-    width = _DIALOG_WIDTH - len(_COMMAND_INDENT)
-    lines: list[str] = []
-    for part in cmd_str.split("\n"):
-        lines.extend(
-            textwrap.wrap(
-                part,
-                width=width,
-                expand_tabs=False,
-                replace_whitespace=False,
-                drop_whitespace=False,
-                break_on_hyphens=False,
-            )
-            or [""]
-        )
-    return [_COMMAND_INDENT + line for line in lines]
+    lines = textwrap.wrap(
+        text,
+        width=_DIALOG_WIDTH - len(_COMMAND_INDENT),
+        expand_tabs=False,
+        replace_whitespace=False,
+        drop_whitespace=False,
+        break_on_hyphens=False,
+    )
+    return [_COMMAND_INDENT + line for line in lines or [""]]
 
 
 def _format_approval_msg(cmd_str: str, org: str, repo: str | None = None) -> str:
-    target = f"Repository: {repo}" if repo else f"Organization: {org}"
-    command = "\n".join(_wrap_command(cmd_str))
+    target = f"Repository: {_display_safe(repo)}" if repo else f"Organization: {org}"
+    command = "\n".join(_wrap_command(_display_safe(cmd_str)))
     return (
         "A GitHub command requires elevated (write) permissions.\n\n"
         f"{target}\n"
@@ -1257,7 +1278,7 @@ def _ask_kdialog(
             "--title",
             "GitHub Elevated Access (ghsudo)",
             "--yesno",
-            msg,
+            msg.replace("\\", "\\\\"),  # kdialog unescapes \\ and \n itself
             "--yes-label",
             "Allow",
             "--no-label",
@@ -1305,8 +1326,10 @@ def _ask_powershell(
     cancel: _GuiCancel | None = None,
 ) -> bool | None:
     """Returns True=approved, False=denied, None=unavailable."""
-    escaped = _escape_for_powershell(cmd_str)
-    raw_target = f"Repository: {repo}" if repo else f"Organization: {org}"
+    escaped = _escape_for_powershell(_display_safe(cmd_str))
+    raw_target = (
+        f"Repository: {_display_safe(repo)}" if repo else f"Organization: {org}"
+    )
     target = _escape_for_powershell(raw_target)
     ps = (
         "Add-Type -AssemblyName System.Windows.Forms; "
@@ -1345,24 +1368,12 @@ def _ask_gui(
     timeout: int = _GUI_TIMEOUT,
     cancel: _GuiCancel | None = None,
 ) -> bool | None:
-    """Ask via the platform's dialog. None means no toolkit could show it."""
-    try:
-        return _ask_platform_gui(cmd_str, org, repo, timeout=timeout, cancel=cancel)
-    except _DialogFailed as exc:
-        # The display is gone, not the toolkit: further toolkits would only
-        # fail (or hang) on the same display. Leave the decision to ntfy.
-        _info(f"Approval dialog failed ({exc}) — not treated as a denial.")
-        return None
+    """Ask via the platform's dialog.
 
-
-def _ask_platform_gui(
-    cmd_str: str,
-    org: str,
-    repo: str | None,
-    *,
-    timeout: int,
-    cancel: _GuiCancel | None,
-) -> bool | None:
+    None means no toolkit could show it, or another channel answered first.
+    Raises _DialogFailed when a dialog died without an answer: further
+    toolkits are not tried, as they would fail (or hang) on the same display.
+    """
     system = platform.system()
     if system == "Linux":
         # Try lightest first: xmessage → zenity → kdialog
@@ -1397,15 +1408,21 @@ def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
     # While the phone can still answer, the dialog must stay up just as long.
     timeout = max(_GUI_TIMEOUT, cfg.timeout) if remote and cfg else _GUI_TIMEOUT
     cancel = _GuiCancel()
+    dialog_failed = threading.Event()
+
+    def _gui() -> bool | None:
+        try:
+            return _ask_gui(cmd_str, org, repo, timeout=timeout, cancel=cancel)
+        except _DialogFailed as exc:
+            _debug(f"approval: dialog failed: {exc}")
+            dialog_failed.set()
+            if remote:
+                _info("The approval dialog failed — still waiting for ntfy.")
+            return None
+
     channels: list[_Channel] = []
     if has_display:
-        channels.append(
-            (
-                "gui",
-                lambda: _ask_gui(cmd_str, org, repo, timeout=timeout, cancel=cancel),
-                cancel.set,
-            )
-        )
+        channels.append(("gui", _gui, cancel.set))
     if remote and cfg is not None:
         ntfy = _NtfyChannel(cfg, cmd_str, org, repo)
         channels.append(("ntfy", ntfy.run, ntfy.cancel))
@@ -1428,6 +1445,13 @@ def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
             _err(
                 "Or approve from your phone:  ghsudo --setup-ntfy --mode remote-approve"
             )
+    elif dialog_failed.is_set():
+        _err(
+            "Cannot request approval: the dialog failed or lost its display connection."
+        )
+        _err("Check DISPLAY / WAYLAND_DISPLAY (e.g. a dropped ssh -X) and retry.")
+        if remote:
+            _err("The ntfy approval request could not be delivered either.")
     else:
         _err("Cannot request approval: no supported GUI dialog tool found.")
         if system == "Linux":

@@ -197,8 +197,10 @@ Setup sends a test notification and stores the settings encrypted at `~/.config/
 | 0 | Success |
 | 1 | Error |
 | 2 | User denied the request (or no answer before the timeout) |
-| 3 | No approval channel available (no display and no supported GUI dialog tool, with no ntfy remote-approve configured) |
+| 3 | No approval channel available (no display, no supported GUI dialog tool, or the dialog lost its display connection — with no ntfy remote-approve configured) |
 | 4 | No token stored for the target org |
+
+When piping `ghsudo` (e.g. `ghsudo git push 2>&1 | tail`), `$?` is the status of the last command in the pipe, not of `ghsudo` — check `${PIPESTATUS[0]}` (bash) or enable `set -o pipefail`.
 
 ## Debugging
 

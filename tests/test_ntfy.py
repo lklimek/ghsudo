@@ -1302,9 +1302,26 @@ class TestDenialExitCode:
         with _patch_urlopen(_FakeUrlopen(stream=stream)):
             assert main.main() == main.EXIT_DENIED
 
-    def test_gui_timeout_exits_denied(self, no_ntfy, monkeypatch):
+    def test_gui_deny_exits_denied(self, no_ntfy, monkeypatch):
         monkeypatch.setattr(main, "_has_display", lambda: True)
         monkeypatch.setattr(main, "_load_token", lambda org: "gh-token")
         monkeypatch.setattr(main, "_detect_repo_slug", lambda cmd: None)
         monkeypatch.setattr(main, "_ask_gui", lambda *a, **k: False)
         assert main.cmd_run(["git", "push"], org="acme") == main.EXIT_DENIED
+
+    def test_gui_timeout_exits_denied(self, no_ntfy, monkeypatch):
+        """A dialog nobody answers times out in the real _run_gui and denies."""
+        real_run_gui = main._run_gui
+
+        def _unanswered_dialog(_cmd, **kwargs):
+            return real_run_gui(["/bin/sleep", "30"], **kwargs)
+
+        monkeypatch.setattr(main, "_GUI_TIMEOUT", 1)
+        monkeypatch.setattr(main, "_has_display", lambda: True)
+        monkeypatch.setattr(main.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(main, "_run_gui", _unanswered_dialog)
+        monkeypatch.setattr(main, "_load_token", lambda org: "gh-token")
+        monkeypatch.setattr(main, "_detect_repo_slug", lambda cmd: None)
+        begin = time.monotonic()
+        assert main.cmd_run(["git", "push"], org="acme") == main.EXIT_DENIED
+        assert time.monotonic() - begin < 10
