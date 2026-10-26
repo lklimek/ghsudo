@@ -78,12 +78,15 @@ _COMMAND_INDENT = "  "
 # which shares the same exit code (1) for xmessage, zenity and kdialog.
 _DISPLAY_ERROR_RE = re.compile(
     r"(?:can'?t|cannot|could ?n[o']t|unable to|failed to) (?:open|connect to) "
-    r"(?:the )?(?:display|x server)"
+    r"(?:the )?(?:display|x server|wayland display)"
     r"|x connection to \S+ broken"
     r"|\bxio:|fatal io error"
-    r"|x11 connection broke"
+    r"|(?:x11|wayland) connection broke"
     r"|error reading events from display"
-    r"|lost connection to wayland",
+    r"|dispatching to wayland display"
+    r"|lost connection to wayland"
+    r"|failed to create wl_display"
+    r"|unable to init server",
     re.IGNORECASE,
 )
 
@@ -107,9 +110,9 @@ def _info(msg: str) -> None:
     print(f"{_PREFIX} {msg}", file=sys.stderr)
 
 
-def _topic_suffix(topic: str) -> str:
-    """Name the long-lived topic only in verbose mode — it is semi-secret."""
-    return f" '{topic}'" if _VERBOSE else ""
+def _ntfy_target(cfg: _NtfyConfig) -> str:
+    """Where ntfy messages go; the topic is semi-secret, so verbose mode only."""
+    return f"{cfg.server}/{cfg.topic}" if _VERBOSE else cfg.server
 
 
 def _debug(msg: str) -> None:
@@ -903,7 +906,7 @@ class _NtfyChannel:
             return None
 
         _info(
-            f"ntfy: approval request sent{_topic_suffix(self._cfg.topic)} "
+            f"ntfy: approval request sent to {_ntfy_target(self._cfg)} "
             f"(waiting up to {self._cfg.timeout}s)"
         )
         timed_out = False
@@ -1055,7 +1058,7 @@ class _GuiCancel:
             self._proc = None
 
 
-class _DialogFailed(Exception):
+class _DialogError(Exception):
     """The dialog died without an answer, e.g. its display connection broke."""
 
 
@@ -1070,7 +1073,7 @@ def _run_gui(
     Returns 1 (denial) on timeout — the user didn't respond in time.
     Returns None when the tool is not installed, or when *cancel* fires
     because another approval channel answered first.
-    Raises _DialogFailed when the dialog crashed or lost its display: that
+    Raises _DialogError when the dialog crashed or lost its display: that
     is not a Deny, even though the exit code may look like one.
     """
     _debug(f"gui: launching {cmd[0]}")
@@ -1123,7 +1126,7 @@ def _raise_if_dialog_failed(name: str, proc: subprocess.Popen) -> None:
     if proc.returncode == 0:
         return
     if proc.returncode < 0:
-        raise _DialogFailed(f"{name} killed by signal {-proc.returncode}")
+        raise _DialogError(f"{name} killed by signal {-proc.returncode}")
     try:
         # Bounded: a lingering grandchild could hold the pipe open forever.
         _out, err = proc.communicate(timeout=1)
@@ -1132,7 +1135,7 @@ def _raise_if_dialog_failed(name: str, proc: subprocess.Popen) -> None:
     stderr = (err or b"").decode(errors="replace")
     if _DISPLAY_ERROR_RE.search(stderr):
         _debug(f"gui: {name} display failure: {stderr.strip()}")
-        raise _DialogFailed(f"{name} lost its display connection")
+        raise _DialogError(f"{name} lost its display connection")
 
 
 def _kill_gui(proc: subprocess.Popen) -> None:
@@ -1371,18 +1374,30 @@ def _ask_gui(
     """Ask via the platform's dialog.
 
     None means no toolkit could show it, or another channel answered first.
-    Raises _DialogFailed when a dialog died without an answer: further
-    toolkits are not tried, as they would fail (or hang) on the same display.
+    Raises _DialogError when a dialog died without an answer: further
+    toolkits are not tried, as they would fail (or hang) on the same display
+    — except after an X11-only xmessage failure while Wayland is available.
     """
     system = platform.system()
     if system == "Linux":
         # Try lightest first: xmessage → zenity → kdialog
+        x11_failure: _DialogError | None = None
         for ask in (_ask_xmessage, _ask_zenity, _ask_kdialog):
             if cancel is not None and cancel.is_set():
                 return None
-            result = ask(cmd_str, org, repo, timeout=timeout, cancel=cancel)
+            try:
+                result = ask(cmd_str, org, repo, timeout=timeout, cancel=cancel)
+            except _DialogError as exc:
+                # xmessage is X11-only; GTK/Qt dialogs may still reach Wayland.
+                if ask is _ask_xmessage and os.environ.get("WAYLAND_DISPLAY"):
+                    _debug(f"gui: {exc} — trying a Wayland-capable dialog")
+                    x11_failure = exc
+                    continue
+                raise
             if result is not None:
                 return result
+        if x11_failure is not None:
+            raise x11_failure
         return None
     if system == "Darwin":
         return _ask_osascript(cmd_str, org, repo, timeout=timeout, cancel=cancel)
@@ -1413,7 +1428,7 @@ def _ask_approval(cmd_str: str, org: str, *, repo: str | None = None) -> bool:
     def _gui() -> bool | None:
         try:
             return _ask_gui(cmd_str, org, repo, timeout=timeout, cancel=cancel)
-        except _DialogFailed as exc:
+        except _DialogError as exc:
             _debug(f"approval: dialog failed: {exc}")
             dialog_failed.set()
             if remote:
@@ -1583,9 +1598,12 @@ def _prompt(label: str, default: str) -> str | None:
     return answer or default
 
 
+_NTFY_SETUP_FLAGS = ("--mode", "--server", "--topic")
+
+
 def _parse_ntfy_flags(args: list[str]) -> dict[str, str] | None:
     """Parse --mode/--server/--topic for --setup-ntfy. None on a bad option."""
-    known = ("--mode", "--server", "--topic")
+    known = _NTFY_SETUP_FLAGS
     opts: dict[str, str] = {}
     i = 0
     while i < len(args):
@@ -1788,9 +1806,7 @@ def _verify_tokens(org: str | None) -> int:
 def _verify_ntfy(cfg: _NtfyConfig) -> int:
     """Publish a test notification to confirm the ntfy channel works."""
     _info(f"--- ntfy ({cfg.mode}) ---")
-    _info(
-        f"Publishing a test notification to {cfg.server}{_topic_suffix(cfg.topic)} ..."
-    )
+    _info(f"Publishing a test notification to {_ntfy_target(cfg)} ...")
     if not _ntfy_publish(
         cfg,
         topic=cfg.topic,
@@ -1886,8 +1902,7 @@ def cmd_list() -> int:
 
     cfg = _load_ntfy_config()
     if cfg is not None:
-        topic = f", topic '{cfg.topic}'" if _VERBOSE else ""
-        _info(f"ntfy: configured ({cfg.mode}{topic} on {cfg.server})")
+        _info(f"ntfy: configured ({cfg.mode} on {_ntfy_target(cfg)})")
     return EXIT_OK
 
 
@@ -1924,9 +1939,46 @@ Options:
 """
 
 
+def _pop_verbose(argv: list[str]) -> tuple[list[str], bool]:
+    """Remove -v/--verbose from ghsudo's own options, in any position.
+
+    Scanning stops at the first token that is not a ghsudo option: from
+    there on everything belongs to the command and passes through untouched.
+    """
+    kept: list[str] = []
+    verbose = False
+    in_setup_ntfy = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-v", "--verbose"):
+            verbose = True
+            i += 1
+            continue
+        if in_setup_ntfy and arg.partition("=")[0] in _NTFY_SETUP_FLAGS:
+            width = 1 if "=" in arg else 2
+        elif arg == "--setup-ntfy":
+            in_setup_ntfy = True
+            width = 1
+        elif arg in ("--setup", "--org"):
+            width = 2
+        elif arg in ("--verify", "--revoke"):
+            has_org = i + 1 < len(argv) and not argv[i + 1].startswith("-")
+            width = 2 if has_org else 1
+        elif arg in ("--list", "-h", "--help"):
+            width = 1
+        else:
+            return kept + argv[i:], verbose
+        kept.extend(argv[i : i + width])
+        i += width
+    return kept, verbose
+
+
 def main() -> int:
     global _VERBOSE  # noqa: PLW0603 — CLI flag mirrors GHSUDO_DEBUG
-    argv = sys.argv[1:]
+    argv, verbose = _pop_verbose(sys.argv[1:])
+    if verbose:
+        _VERBOSE = True
 
     if not argv or "-h" in argv or "--help" in argv:
         print(_USAGE, file=sys.stderr)
@@ -1948,21 +2000,19 @@ def main() -> int:
             if opts is None:
                 return EXIT_ERROR
             return cmd_setup_ntfy(**opts)
-        elif arg in ("-v", "--verbose"):
-            _VERBOSE = True
         elif arg == "--list":
             return cmd_list()
         elif arg == "--verify":
             verify_org = (
                 argv[i + 1]
-                if i + 1 < len(argv) and not argv[i + 1].startswith("--")
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-")
                 else None
             )
             return cmd_verify(verify_org)
         elif arg == "--revoke":
             revoke_org = (
                 argv[i + 1]
-                if i + 1 < len(argv) and not argv[i + 1].startswith("--")
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-")
                 else None
             )
             return cmd_revoke(revoke_org)

@@ -36,15 +36,16 @@ When bumping the version, edit **only** `pyproject.toml`.
 
 ## Testing
 
-The package is not installed in the dev environment, so point Python at `src/`
-(or run `pip install -e .` first, as CI does):
+Run `pip install -e .` first (as CI does), or point Python at `src/` when the
+package is not installed:
 
 ```bash
 PYTHONPATH=src python3 -m pytest tests/ -v
 ```
 
-Only run formatting/linting right before committing (`ruff` is a standalone
-binary, not a Python module):
+Only run formatting/linting right before committing. Call the `ruff` executable
+directly — it works for pip, pipx and standalone installs alike, whereas
+`python -m ruff` needs ruff installed into that interpreter:
 
 ```bash
 ruff check src/ tests/ && ruff format src/ tests/
